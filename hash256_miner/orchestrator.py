@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Protocol
 
 from eth_account.signers.local import LocalAccount
 
@@ -48,109 +48,51 @@ class MinerConfig:
     max_fee_gwei: Optional[float] = None
     gas_limit: int = 200_000
     credential_diagnostics: Optional[str] = None
+    tui: bool = False
 
 
-class Orchestrator:
-    def __init__(
-        self,
-        rpc: Hash256RpcClient,
-        gpu: GpuMiner,
-        account: Optional[LocalAccount],
-        config: MinerConfig,
-    ):
-        self.rpc = rpc
-        self.gpu = gpu
-        self.account = account
-        self.config = config
-        self._stop = threading.Event()
+class MinerReporter(Protocol):
+    def start(self, gpu: GpuMiner, config: MinerConfig) -> None: ...
+    def stop(self) -> None: ...
+    def signal(self, signum: int) -> None: ...
+    def job(self, job: MiningJob, config: MinerConfig) -> None: ...
+    def refresh(self, elapsed: float, refresh_seconds: float) -> None: ...
+    def status(self, gpu: GpuMiner, job: MiningJob, *, refresh_seconds: float) -> None: ...
+    def solution(self, sol: Solution, job: MiningJob) -> None: ...
+    def submit_disabled(self) -> None: ...
+    def submit_success(self, tx_hash: str) -> None: ...
+    def submit_dry_run(self) -> None: ...
 
-    # --- lifecycle -----------------------------------------------------------
 
-    def stop(self):
-        self._stop.set()
+class ConsoleReporter:
+    def start(self, gpu: GpuMiner, config: MinerConfig) -> None:
+        return None
 
-    def install_signal_handlers(self):
-        def handler(signum, frame):
-            print(
-                f"\n[signal] caught signal {signum}, stopping after current GPU batch...",
-                file=sys.stderr,
-                flush=True,
-            )
-            self.stop()
-        signal.signal(signal.SIGINT, handler)
-        signal.signal(signal.SIGTERM, handler)
+    def stop(self) -> None:
+        return None
 
-    # --- main loop -----------------------------------------------------------
+    def signal(self, signum: int) -> None:
+        print(
+            f"\n[signal] caught signal {signum}, stopping after current GPU batch...",
+            file=sys.stderr,
+            flush=True,
+        )
 
-    def run(self):
-        self.install_signal_handlers()
-        fetch_retry_seconds = 5.0
+    def job(self, job: MiningJob, config: MinerConfig) -> None:
+        _print_job(job, config)
 
-        while not self._stop.is_set():
-            try:
-                job = self.rpc.fetch_job()
-            except Exception as e:  # noqa: BLE001 — RPC layer is finicky
-                retry_seconds = fetch_retry_seconds
-                if is_rate_limited_error(e):
-                    fetch_retry_seconds = min(fetch_retry_seconds * 2, 120.0)
-                else:
-                    fetch_retry_seconds = 5.0
-                log.error(
-                    "Failed to fetch job: %s. %sRetrying in %.0fs.",
-                    e,
-                    _format_credential_diagnostics(self.config.credential_diagnostics),
-                    retry_seconds,
-                )
-                time.sleep(retry_seconds)
-                continue
-            fetch_retry_seconds = 5.0
+    def refresh(self, elapsed: float, refresh_seconds: float) -> None:
+        print(
+            f"[refresh] job age={elapsed:.1f}s reached "
+            f"refresh interval={refresh_seconds:.1f}s; fetching new state",
+            file=sys.stderr,
+            flush=True,
+        )
 
-            _print_job(job, self.config)
+    def status(self, gpu: GpuMiner, job: MiningJob, *, refresh_seconds: float) -> None:
+        _print_status(gpu, job, refresh_seconds=refresh_seconds)
 
-            # Mine until either: solution found, epoch likely rotated, or
-            # the refresh timer fires. We run the GPU in short slices so
-            # status output is visible while a job is still active.
-            while not self._stop.is_set():
-                elapsed = time.time() - job.fetched_at
-                refresh_in = self.config.refresh_seconds - elapsed
-                if refresh_in <= 0:
-                    print(
-                        f"[refresh] job age={elapsed:.1f}s reached "
-                        f"refresh interval={self.config.refresh_seconds:.1f}s; fetching new state",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    break
-
-                status_seconds = max(self.config.print_status_seconds, 0.1)
-                slice_seconds = min(status_seconds, refresh_in)
-                found_solution = False
-
-                generator = self.gpu.mine(
-                    challenge=job.challenge,
-                    target=job.target,
-                    max_seconds=slice_seconds,
-                )
-                for solution in generator:
-                    self._handle_solution(solution, job)
-                    found_solution = True
-                    # After submitting, break out and pull a fresh job — the
-                    # contract may have advanced the epoch / difficulty.
-                    break
-
-                _print_status(
-                    self.gpu,
-                    job,
-                    refresh_seconds=self.config.refresh_seconds,
-                )
-
-                if found_solution:
-                    break
-
-            if self._stop.is_set():
-                break
-
-    def _handle_solution(self, sol: Solution, job: MiningJob):
+    def solution(self, sol: Solution, job: MiningJob) -> None:
         print(
             "\n[found]\n"
             f"  nonce  = 0x{sol.nonce.to_bytes(32, 'big').hex()}\n"
@@ -161,8 +103,118 @@ class Orchestrator:
             flush=True,
         )
 
+    def submit_disabled(self) -> None:
+        print("[submit] disabled; not broadcasting", file=sys.stderr, flush=True)
+
+    def submit_success(self, tx_hash: str) -> None:
+        print(f"[submit] submitted: 0x{tx_hash}", file=sys.stderr, flush=True)
+
+    def submit_dry_run(self) -> None:
+        print("[submit] dry-run complete", file=sys.stderr, flush=True)
+
+
+class Orchestrator:
+    def __init__(
+        self,
+        rpc: Hash256RpcClient,
+        gpu: GpuMiner,
+        account: Optional[LocalAccount],
+        config: MinerConfig,
+        reporter: Optional[MinerReporter] = None,
+    ):
+        self.rpc = rpc
+        self.gpu = gpu
+        self.account = account
+        self.config = config
+        self.reporter = reporter or ConsoleReporter()
+        self._stop = threading.Event()
+
+    # --- lifecycle -----------------------------------------------------------
+
+    def stop(self):
+        self._stop.set()
+
+    def install_signal_handlers(self):
+        def handler(signum, frame):
+            self.reporter.signal(signum)
+            self.stop()
+        signal.signal(signal.SIGINT, handler)
+        signal.signal(signal.SIGTERM, handler)
+
+    # --- main loop -----------------------------------------------------------
+
+    def run(self):
+        self.install_signal_handlers()
+        self.reporter.start(self.gpu, self.config)
+        fetch_retry_seconds = 5.0
+
+        try:
+            while not self._stop.is_set():
+                try:
+                    job = self.rpc.fetch_job(include_balance=self.config.tui)
+                except Exception as e:  # noqa: BLE001 — RPC layer is finicky
+                    retry_seconds = fetch_retry_seconds
+                    if is_rate_limited_error(e):
+                        fetch_retry_seconds = min(fetch_retry_seconds * 2, 120.0)
+                    else:
+                        fetch_retry_seconds = 5.0
+                    log.error(
+                        "Failed to fetch job: %s. %sRetrying in %.0fs.",
+                        e,
+                        _format_credential_diagnostics(self.config.credential_diagnostics),
+                        retry_seconds,
+                    )
+                    time.sleep(retry_seconds)
+                    continue
+                fetch_retry_seconds = 5.0
+
+                self.reporter.job(job, self.config)
+
+                # Mine until either: solution found, epoch likely rotated, or
+                # the refresh timer fires. We run the GPU in short slices so
+                # status output is visible while a job is still active.
+                while not self._stop.is_set():
+                    elapsed = time.time() - job.fetched_at
+                    refresh_in = self.config.refresh_seconds - elapsed
+                    if refresh_in <= 0:
+                        self.reporter.refresh(elapsed, self.config.refresh_seconds)
+                        break
+
+                    status_seconds = max(self.config.print_status_seconds, 0.1)
+                    slice_seconds = min(status_seconds, refresh_in)
+                    found_solution = False
+
+                    generator = self.gpu.mine(
+                        challenge=job.challenge,
+                        target=job.target,
+                        max_seconds=slice_seconds,
+                    )
+                    for solution in generator:
+                        self._handle_solution(solution, job)
+                        found_solution = True
+                        # After submitting, break out and pull a fresh job — the
+                        # contract may have advanced the epoch / difficulty.
+                        break
+
+                    self.reporter.status(
+                        self.gpu,
+                        job,
+                        refresh_seconds=self.config.refresh_seconds,
+                    )
+
+                    if found_solution:
+                        break
+
+                if self._stop.is_set():
+                    break
+        finally:
+            self.reporter.stop()
+
+    def _handle_solution(self, sol: Solution, job: MiningJob):
+        self.reporter.solution(sol, job)
+
         if not self.config.submit:
-            print("[submit] disabled; not broadcasting", file=sys.stderr, flush=True)
+            self.reporter.submit_disabled()
             return
         if self.account is None:
             log.warning("no private key configured — cannot submit")
@@ -178,9 +230,9 @@ class Orchestrator:
                 gas_limit=self.config.gas_limit,
             )
             if tx_hash:
-                print(f"[submit] submitted: 0x{tx_hash}", file=sys.stderr, flush=True)
+                self.reporter.submit_success(tx_hash)
             else:
-                print("[submit] dry-run complete", file=sys.stderr, flush=True)
+                self.reporter.submit_dry_run()
         except Exception as e:  # noqa: BLE001
             log.error("Submit failed: %s", e)
 

@@ -124,3 +124,38 @@ def test_fetch_job_uses_mining_state_and_get_challenge():
     assert job.target == 12345
     assert job.epoch == 250
     assert [sig for sig, _args in calls] == ["miningState()", "getChallenge(address)"]
+
+
+def test_fetch_job_can_include_miner_balance():
+    miner = "0x04cec3e6CDfeF6CcEc8c098d70FF4f6E5C00e8e8"
+    challenge = bytes.fromhex("22" * 32)
+    client = Hash256RpcClient.__new__(Hash256RpcClient)
+    client._sigs = dict(DEFAULT_VIEWS)
+    client.miner_address = miner
+    client.contract = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc"
+    client.chain_id = 1
+    calls = []
+
+    def fake_call(sig, args=b""):
+        calls.append((sig, args))
+        if sig == "miningState()":
+            return b"".join(i.to_bytes(32, "big") for i in [1, 100, 12345, 500, 900, 250, 42])
+        if sig == "getChallenge(address)":
+            return challenge
+        if sig == "balanceOf(address)":
+            assert args == client.miner_address_as_word()
+            return (123).to_bytes(32, "big")
+        raise AssertionError(f"unexpected call {sig}")
+
+    client._call = fake_call
+
+    job = client.fetch_job(include_balance=True)
+
+    assert job.state is not None
+    assert job.state.reward == 100
+    assert job.miner_balance == 123
+    assert [sig for sig, _args in calls] == [
+        "miningState()",
+        "getChallenge(address)",
+        "balanceOf(address)",
+    ]

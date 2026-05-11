@@ -52,10 +52,12 @@ def test_mine_no_submit_ignores_private_key_env(monkeypatch):
     seen = {}
 
     class DummyOrchestrator:
-        def __init__(self, _rpc, _gpu, account, config):
+        def __init__(self, _rpc, _gpu, account, config, reporter=None):
             seen["account"] = account
             seen["submit"] = config.submit
             seen["status_seconds"] = config.print_status_seconds
+            seen["tui"] = config.tui
+            seen["reporter"] = reporter
 
         def run(self):
             seen["ran"] = True
@@ -92,6 +94,8 @@ def test_mine_no_submit_ignores_private_key_env(monkeypatch):
         "account": None,
         "submit": False,
         "status_seconds": 1.25,
+        "tui": False,
+        "reporter": None,
         "ran": True,
     }
 

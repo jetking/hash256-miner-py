@@ -59,6 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="How often to re-pull challenge/difficulty.")
     mine.add_argument("--status-seconds", type=float, default=2.0,
                       help="How often to print live mining status.")
+    mine.add_argument("--tui", action="store_true",
+                      help="Show a live terminal dashboard instead of plain status lines.")
     mine.add_argument("--rpc-min-interval", type=float, default=1.0,
                       help="Minimum seconds between JSON-RPC requests. Increase "
                            "this for public endpoints that return HTTP/RPC 429.")
@@ -69,7 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
                       metavar="KEY=SIGNATURE",
                       help="Override a contract function signature. Example: "
                            "--abi-override difficulty=getDifficulty()  "
-                           "Keys: challenge_for, difficulty, mining_state, total_mints.")
+                           "Keys: challenge_for, difficulty, mining_state, "
+                           "total_mints, balance.")
     mine.add_argument("--submit-signature", default=None,
                       help="Override the submit function signature, e.g. "
                            "mint(uint256). Default: mine(uint256)")
@@ -259,6 +262,7 @@ def cmd_mine(args) -> int:
         priority_fee_gwei=args.priority_fee_gwei,
         max_fee_gwei=args.max_fee_gwei,
         gas_limit=args.gas_limit,
+        tui=args.tui,
         credential_diagnostics=_build_credential_diagnostics(
             account=account,
             private_key_source=private_key_source,
@@ -268,7 +272,15 @@ def cmd_mine(args) -> int:
         ),
     )
 
-    Orchestrator(rpc, gpu, account, config).run()
+    reporter = None
+    if args.tui:
+        try:
+            from .tui import TuiReporter
+        except ModuleNotFoundError as e:
+            return _missing_dependency_error(e, command="mine --tui")
+        reporter = TuiReporter()
+
+    Orchestrator(rpc, gpu, account, config, reporter=reporter).run()
     return 0
 
 

@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     "pyopencl>=2024.1",
     "numpy>=1.24",
+    "rich>=13",
     "web3>=6.20,<8",
     "eth-account>=0.10",
     "eth-utils>=4.0",

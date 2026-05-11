@@ -35,6 +35,7 @@ DEFAULT_VIEWS = {
     "mining_state":  "miningState()",                   # returns 7 uint256 words
     "block_number":  "blockNumber()",                   # returns uint256, optional
     "total_mints":   "totalMints()",                    # returns uint256, optional
+    "balance":       "balanceOf(address)",              # returns uint256, optional
 }
 
 def is_rate_limited_error(exc: BaseException) -> bool:
@@ -49,15 +50,6 @@ def is_rate_limited_error(exc: BaseException) -> bool:
 
 
 @dataclass
-class MiningJob:
-    """Everything a worker needs to start hashing."""
-    challenge: bytes        # 32 bytes
-    target: int             # uint256 difficulty target
-    epoch: int              # whatever the contract considers the current epoch
-    fetched_at: float       # wall-clock seconds, for staleness checks
-
-
-@dataclass
 class MiningState:
     era: int
     reward: int
@@ -66,6 +58,17 @@ class MiningState:
     remaining: int
     epoch: int
     epoch_blocks_left: int
+
+
+@dataclass
+class MiningJob:
+    """Everything a worker needs to start hashing."""
+    challenge: bytes        # 32 bytes
+    target: int             # uint256 difficulty target
+    epoch: int              # whatever the contract considers the current epoch
+    fetched_at: float       # wall-clock seconds, for staleness checks
+    state: Optional[MiningState] = None
+    miner_balance: Optional[int] = None
 
 
 class Hash256RpcClient:
@@ -163,6 +166,16 @@ class Hash256RpcClient:
         except Exception:  # noqa: BLE001 — optional view, swallow
             return -1
 
+    def get_balance(self) -> Optional[int]:
+        try:
+            raw = self._call(
+                self._sigs["balance"],
+                self.miner_address_as_word(),
+            )
+            return int.from_bytes(raw[-32:], "big") if raw else 0
+        except Exception:  # noqa: BLE001 — optional ERC-20 view, swallow
+            return None
+
     def get_challenge_from_chain(self) -> Optional[bytes]:
         """Ask the contract directly for *this miner's* challenge.
 
@@ -200,7 +213,7 @@ class Hash256RpcClient:
 
     # --- the combined "give me a job" call ------------------------------------
 
-    def fetch_job(self) -> MiningJob:
+    def fetch_job(self, *, include_balance: bool = False) -> MiningJob:
         """Pull a fresh (challenge, target, epoch) snapshot from the chain."""
         state = self.get_mining_state()
 
@@ -216,6 +229,8 @@ class Hash256RpcClient:
             target=state.difficulty,
             epoch=state.epoch,
             fetched_at=time.time(),
+            state=state,
+            miner_balance=self.get_balance() if include_balance else None,
         )
 
     # --- transaction submission ----------------------------------------------
