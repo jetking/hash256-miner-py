@@ -46,6 +46,7 @@ class TuiReporter(logging.Handler):
         self.previous_handlers: list[logging.Handler] = []
         self._gpu_load: Optional[float] = None
         self._gpu_load_checked_at = 0.0
+        self._last_tx: Optional[str] = None
 
     def start(self, gpu: GpuMiner, config: MinerConfig) -> None:
         self.gpu = gpu
@@ -115,12 +116,15 @@ class TuiReporter(logging.Handler):
         )
 
     def submit_disabled(self) -> None:
+        self._last_tx = "submit disabled"
         self._append_log("[submit] disabled; not broadcasting")
 
     def submit_success(self, tx_hash: str) -> None:
-        self._append_log(f"[submit] submitted: 0x{tx_hash}")
+        self._last_tx = "0x" + tx_hash.removeprefix("0x")
+        self._append_log(f"[submit] submitted: {self._last_tx}")
 
     def submit_dry_run(self) -> None:
+        self._last_tx = "dry-run"
         self._append_log("[submit] dry-run complete")
 
     def _append_log(self, line: str) -> None:
@@ -177,10 +181,44 @@ class TuiReporter(logging.Handler):
         )
 
         hashes = gpu.stats.hashes if gpu else 0
+        avg_hashrate = gpu.stats.hashrate() if gpu else 0.0
         solution_chance = _solution_probability(hashes, job.target) if job else 0.0
         total_progress = _total_mining_progress(state)
         round_progress = _round_progress(job, config.refresh_seconds) if job and config else 0.0
         era_mints_done = _era_mint_count(job)
+
+        browser = Table(
+            show_header=False,
+            expand=True,
+            box=box.SQUARE,
+            show_edge=False,
+            pad_edge=False,
+            collapse_padding=False,
+        )
+        browser.add_column(ratio=1)
+        browser.add_column(ratio=1)
+        browser.add_row(
+            _metric_group(
+                [
+                    ("HASHRATE", _format_hashrate(avg_hashrate) if gpu else "—"),
+                    ("HASHES TRIED", f"{hashes:,}"),
+                    ("CHALLENGE", _format_hash(job.challenge) if job else "—"),
+                ]
+            ),
+            _metric_group(
+                [
+                    (
+                        "EXPECTED REWARD / HR",
+                        _format_expected_reward_per_hour(avg_hashrate, job) if job else "—",
+                    ),
+                    (
+                        "ELAPSED",
+                        _format_elapsed(time.time() - gpu.stats.started_at) if gpu else "—",
+                    ),
+                    ("TX", self._last_tx or "—"),
+                ]
+            ),
+        )
 
         progress = Table.grid(expand=True)
         progress.add_row(Text("TOTAL MINING PROGRESS", style="dim green"))
@@ -210,6 +248,8 @@ class TuiReporter(logging.Handler):
         )
         body.add_column(ratio=1)
         body.add_row(metrics)
+        body.add_row(Text("BROWSER MINER", style="dim green"))
+        body.add_row(browser)
         body.add_row(progress)
 
         title = "[bold green] M I N I N G  S T A T E [/]"
@@ -361,6 +401,43 @@ def _format_token(value: Optional[int]) -> str:
         return f"{whole:,} HASH"
     frac_text = f"{frac:018d}".rstrip("0")[:6]
     return f"{whole:,}.{frac_text} HASH"
+
+
+def _format_token_rate(value: Optional[float]) -> str:
+    if value is None or value <= 0:
+        return "0 HASH/hr"
+    tokens = value / TOKEN_SCALE
+    if tokens >= 1000:
+        text = f"{tokens:,.0f}"
+    elif tokens >= 1:
+        text = f"{tokens:,.4f}".rstrip("0").rstrip(".")
+    else:
+        text = f"{tokens:.8f}".rstrip("0").rstrip(".")
+    return f"{text} HASH/hr"
+
+
+def _format_expected_reward_per_hour(hashrate: float, job: MiningJob) -> str:
+    if hashrate <= 0 or job.target <= 0 or job.state is None or job.state.reward <= 0:
+        return "0 HASH/hr"
+    expected_hashes = (1 << 256) / job.target
+    expected_mints_per_hour = hashrate * 3600.0 / expected_hashes
+    return _format_token_rate(expected_mints_per_hour * job.state.reward)
+
+
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(int(seconds), 0)
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:d}h {minutes:02d}m {secs:02d}s"
+    return f"{minutes:d}m {secs:02d}s"
+
+
+def _format_hash(value: bytes) -> str:
+    text = "0x" + value.hex()
+    if len(text) <= 22:
+        return text
+    return f"{text[:12]}…{text[-8:]}"
 
 
 def _format_multiplier(target: int) -> str:

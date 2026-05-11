@@ -100,3 +100,28 @@ def test_mint_count_fallback_accounts_for_prior_halving_eras():
     )
 
     assert tui._mint_count(state) == 100_100
+
+
+def test_expected_reward_per_hour_uses_hashrate_target_and_reward():
+    state = MiningState(
+        era=0,
+        reward=tui.TOKEN_SCALE,
+        difficulty=1 << 255,
+        minted=0,
+        remaining=18_900_000 * tui.TOKEN_SCALE,
+        epoch=123,
+        epoch_blocks_left=42,
+    )
+    job = _job(state)
+    job.target = 1 << 255
+
+    assert tui._format_expected_reward_per_hour(2.0, job) == "3,600 HASH/hr"
+
+
+def test_elapsed_and_hash_formatters_are_compact():
+    assert tui._format_elapsed(65) == "1m 05s"
+    assert tui._format_elapsed(3661) == "1h 01m 01s"
+
+    formatted = tui._format_hash(bytes.fromhex("11" * 32))
+    assert formatted.startswith("0x1111111111")
+    assert formatted.endswith("11111111")
