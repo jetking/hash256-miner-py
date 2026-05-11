@@ -41,6 +41,12 @@ static inline ulong rotl64(ulong x, uint n) {
     return (x << n) | (x >> (64u - n));
 }
 
+// NVIDIA GPUs can lower a three-input xor to LOP3, reducing the instruction
+// count in Theta. Keep non-NVIDIA devices on the original two-step form below.
+static inline ulong lop3_xor3(ulong a, ulong b, ulong c) {
+    return a ^ b ^ c;
+}
+
 // In-place Keccak-f[1600] permutation on a 25-lane state.
 static void keccak_f1600(ulong st[25]) {
     ulong t, bc0, bc1, bc2, bc3, bc4;
@@ -52,6 +58,34 @@ static void keccak_f1600(ulong st[25]) {
         bc3 = st[3] ^ st[8] ^ st[13] ^ st[18] ^ st[23];
         bc4 = st[4] ^ st[9] ^ st[14] ^ st[19] ^ st[24];
 
+#if defined(__NV_CL_C_VERSION)
+        // Apply each column delta as a single three-input xor so NVIDIA's
+        // backend can use LOP3 for st[i] ^ c[x-1] ^ ROT(c[x+1], 1).
+        ulong rc0 = rotl64(bc1, 1);
+        ulong rc1 = rotl64(bc2, 1);
+        ulong rc2 = rotl64(bc3, 1);
+        ulong rc3 = rotl64(bc4, 1);
+        ulong rc4 = rotl64(bc0, 1);
+        st[ 0] = lop3_xor3(st[ 0], bc4, rc0); st[ 5] = lop3_xor3(st[ 5], bc4, rc0);
+        st[10] = lop3_xor3(st[10], bc4, rc0); st[15] = lop3_xor3(st[15], bc4, rc0);
+        st[20] = lop3_xor3(st[20], bc4, rc0);
+
+        st[ 1] = lop3_xor3(st[ 1], bc0, rc1); st[ 6] = lop3_xor3(st[ 6], bc0, rc1);
+        st[11] = lop3_xor3(st[11], bc0, rc1); st[16] = lop3_xor3(st[16], bc0, rc1);
+        st[21] = lop3_xor3(st[21], bc0, rc1);
+
+        st[ 2] = lop3_xor3(st[ 2], bc1, rc2); st[ 7] = lop3_xor3(st[ 7], bc1, rc2);
+        st[12] = lop3_xor3(st[12], bc1, rc2); st[17] = lop3_xor3(st[17], bc1, rc2);
+        st[22] = lop3_xor3(st[22], bc1, rc2);
+
+        st[ 3] = lop3_xor3(st[ 3], bc2, rc3); st[ 8] = lop3_xor3(st[ 8], bc2, rc3);
+        st[13] = lop3_xor3(st[13], bc2, rc3); st[18] = lop3_xor3(st[18], bc2, rc3);
+        st[23] = lop3_xor3(st[23], bc2, rc3);
+
+        st[ 4] = lop3_xor3(st[ 4], bc3, rc4); st[ 9] = lop3_xor3(st[ 9], bc3, rc4);
+        st[14] = lop3_xor3(st[14], bc3, rc4); st[19] = lop3_xor3(st[19], bc3, rc4);
+        st[24] = lop3_xor3(st[24], bc3, rc4);
+#else
         t = bc4 ^ rotl64(bc1, 1);
         st[0] ^= t; st[5] ^= t; st[10] ^= t; st[15] ^= t; st[20] ^= t;
         t = bc0 ^ rotl64(bc2, 1);
@@ -62,6 +96,7 @@ static void keccak_f1600(ulong st[25]) {
         st[3] ^= t; st[8] ^= t; st[13] ^= t; st[18] ^= t; st[23] ^= t;
         t = bc3 ^ rotl64(bc0, 1);
         st[4] ^= t; st[9] ^= t; st[14] ^= t; st[19] ^= t; st[24] ^= t;
+#endif
 
         // Rho + Pi
         ulong tmp = st[1];
