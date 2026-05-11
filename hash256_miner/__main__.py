@@ -10,10 +10,7 @@ import sys
 from typing import Optional
 
 from . import __version__
-from .gpu import GpuMiner, list_devices, pick_device
-from .orchestrator import MinerConfig, Orchestrator
-from .protocol import DEFAULT_CONTRACT, MAINNET_CHAIN_ID, verify_solution
-from .rpc import DEFAULT_SUBMIT, Hash256RpcClient, load_account_from_private_key
+from .constants import DEFAULT_CONTRACT, DEFAULT_SUBMIT, MAINNET_CHAIN_ID
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 def cmd_devices(_args) -> int:
+    try:
+        list_devices = _load_device_listing()
+    except ModuleNotFoundError as e:
+        return _missing_dependency_error(e, command="devices")
+
     rows = list_devices()
     if not rows:
         print("No OpenCL devices found. Install GPU drivers / OpenCL ICDs.")
@@ -116,6 +118,11 @@ def cmd_devices(_args) -> int:
 def cmd_benchmark(args) -> int:
     import secrets
     import time
+
+    try:
+        GpuMiner, pick_device = _load_benchmark_dependencies()
+    except ModuleNotFoundError as e:
+        return _missing_dependency_error(e, command="benchmark")
 
     device = pick_device(args.platform, args.device)
     print(f"Benchmarking on: {device.name.strip()}")
@@ -149,6 +156,11 @@ def cmd_benchmark(args) -> int:
 
 
 def cmd_verify(args) -> int:
+    try:
+        from .protocol import verify_solution
+    except ModuleNotFoundError as e:
+        return _missing_dependency_error(e, command="verify")
+
     challenge = bytes.fromhex(args.challenge.removeprefix("0x"))
     nonce = int(args.nonce, 0)
     target = int(args.target, 0)
@@ -180,9 +192,24 @@ def cmd_mine(args) -> int:
     else:
         private_key = os.environ.get("MINER_PRIVATE_KEY")
         private_key_source = "$MINER_PRIVATE_KEY" if private_key else None
+
+    if not private_key and not args.no_submit:
+        print(
+            "error: no private key supplied and --no-submit not set. "
+            "Pass --private-key, set $MINER_PRIVATE_KEY, or use --no-submit "
+            "to mine without broadcasting.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        Hash256RpcClient, _load_account_from_private_key = _load_rpc_dependencies()
+    except ModuleNotFoundError as e:
+        return _missing_dependency_error(e, command="mine")
+
     if private_key:
         try:
-            account = load_account_from_private_key(private_key)
+            account = _load_account_from_private_key(private_key)
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
             return 2
@@ -192,14 +219,6 @@ def cmd_mine(args) -> int:
                 "The mint will land at the key's address, not the one you passed.",
                 file=sys.stderr,
             )
-    elif not args.no_submit:
-        print(
-            "error: no private key supplied and --no-submit not set. "
-            "Pass --private-key, set $MINER_PRIVATE_KEY, or use --no-submit "
-            "to mine without broadcasting.",
-            file=sys.stderr,
-        )
-        return 2
 
     try:
         rpc = Hash256RpcClient(
@@ -222,6 +241,11 @@ def cmd_mine(args) -> int:
     except Exception as e:
         print(f"error: RPC unreachable: {e}", file=sys.stderr)
         return 1
+
+    try:
+        GpuMiner, MinerConfig, Orchestrator, pick_device = _load_mining_dependencies()
+    except ModuleNotFoundError as e:
+        return _missing_dependency_error(e, command="mine")
 
     device = pick_device(args.platform, args.device)
     print(f"Using device: {device.name.strip()}")
@@ -283,6 +307,47 @@ def _private_key_fingerprint(private_key: Optional[str]) -> str:
     except ValueError:
         return "unavailable"
     return f"sha256:{digest[:12]}"
+
+
+def _load_device_listing():
+    from .gpu import list_devices
+
+    return list_devices
+
+
+def _load_benchmark_dependencies():
+    from .gpu import GpuMiner, pick_device
+
+    return GpuMiner, pick_device
+
+
+def _load_rpc_dependencies():
+    from .rpc import Hash256RpcClient, load_account_from_private_key
+
+    return Hash256RpcClient, load_account_from_private_key
+
+
+def _load_mining_dependencies():
+    from .gpu import GpuMiner, pick_device
+    from .orchestrator import MinerConfig, Orchestrator
+
+    return GpuMiner, MinerConfig, Orchestrator, pick_device
+
+
+def _missing_dependency_error(exc: ModuleNotFoundError, *, command: str) -> int:
+    missing = exc.name or str(exc)
+    print(
+        f"error: missing Python dependency {missing!r} while loading `{command}`.",
+        file=sys.stderr,
+    )
+    print(
+        "Install the project dependencies first, for example:\n"
+        "  py -m pip install -e .\n"
+        "or, for tests:\n"
+        '  py -m pip install -e ".[test]"',
+        file=sys.stderr,
+    )
+    return 2
 
 
 # ---------------------------------------------------------------------------

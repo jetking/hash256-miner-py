@@ -43,6 +43,16 @@ pip install -e .
 
 这会安装 `hash256-miner` 命令。
 
+Windows 下请在仓库目录中使用同一个 Python 启动器安装依赖：
+
+```powershell
+py -m pip install -e .
+py -m hash256_miner --help
+```
+
+如果只是复制源码后直接运行 `py -m hash256_miner`，会缺少 `numpy`、`pyopencl`、`web3`
+等依赖并导致导入失败。
+
 ## 快速开始
 
 ```bash

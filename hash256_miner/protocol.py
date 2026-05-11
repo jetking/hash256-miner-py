@@ -13,9 +13,10 @@ plus helpers for converting between hex / bytes / uint256 and for computing
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Final
 
 from eth_utils import keccak, to_bytes, to_checksum_address
+
+from .constants import DEFAULT_CONTRACT, MAINNET_CHAIN_ID
 
 
 # --- ABI / selector helpers ---------------------------------------------------
@@ -113,9 +114,3 @@ def verify_solution(challenge: bytes, nonce: int, target: int) -> bool:
         raise ValueError("challenge must be 32 bytes")
     digest = keccak(challenge + encode_uint256(nonce))
     return int.from_bytes(digest, "big") < target
-
-
-# --- Misc constants -----------------------------------------------------------
-
-DEFAULT_CONTRACT: Final[str] = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc"
-MAINNET_CHAIN_ID: Final[int] = 1

@@ -1,4 +1,18 @@
+import pytest
+
 from hash256_miner import __main__ as cli
+
+
+class DummyAccount:
+    address = "0x04cec3e6CDfeF6CcEc8c098d70FF4f6E5C00e8e8"
+
+
+def test_help_does_not_load_runtime_dependencies(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--help"])
+
+    assert exc_info.value.code == 0
+    assert "hash256-miner" in capsys.readouterr().out
 
 
 def test_mine_rejects_bad_private_key_before_rpc(monkeypatch, capsys):
@@ -7,7 +21,10 @@ def test_mine_rejects_bad_private_key_before_rpc(monkeypatch, capsys):
     def fail_rpc(*_args, **_kwargs):
         raise AssertionError("RPC should not be constructed for a malformed key")
 
-    monkeypatch.setattr(cli, "Hash256RpcClient", fail_rpc)
+    def bad_key(_private_key):
+        raise ValueError("private key must be a 32-byte hex string")
+
+    monkeypatch.setattr(cli, "_load_rpc_dependencies", lambda: (fail_rpc, bad_key))
 
     rc = cli.main([
         "mine",
@@ -28,6 +45,10 @@ def test_mine_no_submit_ignores_private_key_env(monkeypatch):
     class DummyDevice:
         name = "test device"
 
+    class DummyConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
     seen = {}
 
     class DummyOrchestrator:
@@ -44,10 +65,17 @@ def test_mine_no_submit_ignores_private_key_env(monkeypatch):
         return DummyRpc()
 
     monkeypatch.setenv("MINER_PRIVATE_KEY", "0x...")
-    monkeypatch.setattr(cli, "Hash256RpcClient", make_rpc)
-    monkeypatch.setattr(cli, "pick_device", lambda _platform, _device: DummyDevice())
-    monkeypatch.setattr(cli, "GpuMiner", lambda _device, **_kwargs: object())
-    monkeypatch.setattr(cli, "Orchestrator", DummyOrchestrator)
+    monkeypatch.setattr(cli, "_load_rpc_dependencies", lambda: (make_rpc, object()))
+    monkeypatch.setattr(
+        cli,
+        "_load_mining_dependencies",
+        lambda: (
+            lambda _device, **_kwargs: object(),
+            DummyConfig,
+            DummyOrchestrator,
+            lambda _platform, _device: DummyDevice(),
+        ),
+    )
 
     rc = cli.main([
         "mine",
@@ -73,7 +101,7 @@ def test_mine_reports_rpc_constructor_value_error(monkeypatch, capsys):
         raise ValueError("bad checksum")
 
     monkeypatch.delenv("MINER_PRIVATE_KEY", raising=False)
-    monkeypatch.setattr(cli, "Hash256RpcClient", fail_rpc)
+    monkeypatch.setattr(cli, "_load_rpc_dependencies", lambda: (fail_rpc, object()))
 
     rc = cli.main([
         "mine",
@@ -88,7 +116,7 @@ def test_mine_reports_rpc_constructor_value_error(monkeypatch, capsys):
 
 def test_credential_diagnostics_redacts_private_key():
     private_key = "1" * 64
-    account = cli.load_account_from_private_key(private_key)
+    account = DummyAccount()
 
     diagnostics = cli._build_credential_diagnostics(
         account=account,

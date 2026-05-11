@@ -120,7 +120,7 @@ class GpuMiner:
         self.global_size = global_size
         self.stats = GpuStats()
 
-        kernel_src = KERNEL_PATH.read_text()
+        kernel_src = KERNEL_PATH.read_text(encoding="utf-8")
         log.debug("Building OpenCL program for %s ...", device.name.strip())
         self.program = cl.Program(self.context, kernel_src).build()
         self.kernel = self.program.mine

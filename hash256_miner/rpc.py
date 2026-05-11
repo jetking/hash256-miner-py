@@ -20,12 +20,11 @@ from web3.types import TxParams
 
 from .protocol import (
     ChallengeInputs,
-    DEFAULT_CONTRACT,
-    MAINNET_CHAIN_ID,
     build_challenge,
     encode_uint256,
     selector,
 )
+from .constants import DEFAULT_CONTRACT, DEFAULT_SUBMIT, MAINNET_CHAIN_ID
 
 log = logging.getLogger(__name__)
 
@@ -37,9 +36,6 @@ DEFAULT_VIEWS = {
     "block_number":  "blockNumber()",                   # returns uint256, optional
     "total_mints":   "totalMints()",                    # returns uint256, optional
 }
-
-DEFAULT_SUBMIT = "mine(uint256)"
-
 
 def is_rate_limited_error(exc: BaseException) -> bool:
     """Return True if an RPC exception looks like provider throttling."""
