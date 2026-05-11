@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hash256-miner"
+version = "0.1.0"
+description = "GPU CLI miner for hash256.org (HASH token)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "pyopencl>=2024.1",
+    "numpy>=1.24",
+    "web3>=6.20,<8",
+    "eth-account>=0.10",
+    "eth-utils>=4.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pycryptodome>=3.20"]
+
+[project.scripts]
+hash256-miner = "hash256_miner.__main__:main"
+
+[tool.setuptools]
+packages = ["hash256_miner"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+hash256_miner = ["../kernels/*.cl"]

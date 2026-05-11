@@ -1,0 +1,120 @@
+"""Protocol primitives for hash256.org PoW.
+
+The HASH whitepaper defines the puzzle as:
+
+    challenge = keccak256(chainId ‖ contract ‖ miner ‖ epoch)
+    valid iff keccak256(challenge ‖ nonce) < currentDifficulty
+
+This module contains the pure-Python implementations of those operations,
+plus helpers for converting between hex / bytes / uint256 and for computing
+4-byte function selectors. Nothing here talks to the chain — `rpc.py` does.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Final
+
+from eth_utils import keccak, to_bytes, to_checksum_address
+
+
+# --- ABI / selector helpers ---------------------------------------------------
+
+def selector(signature: str) -> bytes:
+    """Return the first 4 bytes of keccak256(signature)."""
+    return keccak(text=signature)[:4]
+
+
+def encode_address(addr: str) -> bytes:
+    """Encode an Ethereum address as a 32-byte left-padded word."""
+    raw = to_bytes(hexstr=to_checksum_address(addr))
+    if len(raw) != 20:
+        raise ValueError(f"address must decode to 20 bytes, got {len(raw)}")
+    return b"\x00" * 12 + raw
+
+
+def encode_uint256(value: int) -> bytes:
+    if value < 0 or value >= 1 << 256:
+        raise ValueError("uint256 out of range")
+    return value.to_bytes(32, "big")
+
+
+# --- Challenge construction ---------------------------------------------------
+#
+# The exact byte layout of the on-chain challenge is described in the
+# whitepaper as `keccak256(chainId ‖ contract ‖ miner ‖ epoch)`. Smart
+# contracts in Solidity typically build this via abi.encodePacked, which
+# concatenates each value at its natural width:
+#
+#     chainId  : uint256 (32 bytes, big-endian)
+#     contract : address (20 bytes)
+#     miner    : address (20 bytes)
+#     epoch    : uint256 (32 bytes)        # whitepaper doesn't fix the width
+#
+# If the deployed contract instead uses abi.encode (32-byte padded) the
+# layout flips to 4 * 32 = 128 bytes. We support both via the `packed` flag
+# so the user can match whichever the verified contract uses once it ships.
+# Default is packed because that is what every Bitcoin-style PoW token I've
+# seen on Ethereum (0xBTC, ERC918 family) does, and it is by far the cheaper
+# layout in gas terms.
+
+@dataclass(frozen=True)
+class ChallengeInputs:
+    chain_id: int
+    contract: str   # 0x-prefixed checksum address
+    miner: str      # 0x-prefixed checksum address
+    epoch: int      # current epoch number (whitepaper says it rotates every 100 blocks)
+
+
+def build_challenge(inputs: ChallengeInputs, *, packed: bool = True) -> bytes:
+    """Compute the 32-byte challenge for a (miner, epoch) pair.
+
+    Args:
+        inputs: chain id, contract address, miner address, epoch.
+        packed: if True, use Solidity's abi.encodePacked layout
+            (chainId u256 ‖ contract addr20 ‖ miner addr20 ‖ epoch u256),
+            which totals 104 bytes. If False, use abi.encode (128 bytes,
+            all values padded to 32).
+
+    Returns:
+        32-byte keccak256 digest.
+    """
+    contract_raw = to_bytes(hexstr=to_checksum_address(inputs.contract))
+    miner_raw = to_bytes(hexstr=to_checksum_address(inputs.miner))
+
+    if packed:
+        preimage = (
+            encode_uint256(inputs.chain_id)
+            + contract_raw
+            + miner_raw
+            + encode_uint256(inputs.epoch)
+        )
+    else:
+        preimage = (
+            encode_uint256(inputs.chain_id)
+            + encode_address(inputs.contract)
+            + encode_address(inputs.miner)
+            + encode_uint256(inputs.epoch)
+        )
+    return keccak(preimage)
+
+
+# --- Verification -------------------------------------------------------------
+
+def verify_solution(challenge: bytes, nonce: int, target: int) -> bool:
+    """Check whether keccak256(challenge ‖ nonce_uint256_be) < target.
+
+    The contract enforces the same inequality on-chain. We use it both as a
+    sanity check before broadcasting a transaction and as the basis for the
+    CPU verifier in tests.
+    """
+    if len(challenge) != 32:
+        raise ValueError("challenge must be 32 bytes")
+    digest = keccak(challenge + encode_uint256(nonce))
+    return int.from_bytes(digest, "big") < target
+
+
+# --- Misc constants -----------------------------------------------------------
+
+DEFAULT_CONTRACT: Final[str] = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc"
+MAINNET_CHAIN_ID: Final[int] = 1
