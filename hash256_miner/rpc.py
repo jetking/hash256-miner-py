@@ -1,15 +1,8 @@
 """Talk to an Ethereum node to fetch mining state and submit solutions.
 
-The HASH contract exposes some kind of view functions for `challenge()`,
-`difficulty()` and `epoch()` — the whitepaper does not pin the exact ABI
-strings since the source code has not yet been published at the time of
-writing (the genesis mint is still at 0%). This module is written so that
-the four candidate getter names below can be swapped to match the real
-ABI without touching the miner core.
-
-Override the selectors via the `--abi-overrides` CLI flag if the deployed
-contract turns out to use different names — e.g. `getChallenge`,
-`currentDifficulty`, `currentEpoch`.
+The deployed HASH contract exposes `getChallenge(address)`, `miningState()`,
+and `mine(uint256)`. This module keeps the low-level selector plumbing small
+and still allows CLI overrides for future contract variants.
 """
 
 from __future__ import annotations
@@ -37,22 +30,26 @@ from .protocol import (
 log = logging.getLogger(__name__)
 
 
-# Best-guess function signatures for the HASH contract. The whitepaper
-# specifies the puzzle math but not the ABI names. These match the common
-# convention for ERC918-style mineable tokens; the user can override.
 DEFAULT_VIEWS = {
-    "challenge_for": "getChallengeForMiner(address)",   # returns bytes32
+    "challenge_for": "getChallenge(address)",           # returns bytes32
     "difficulty":    "currentDifficulty()",             # returns uint256
-    "epoch":         "currentEpoch()",                  # returns uint256
+    "mining_state":  "miningState()",                   # returns 7 uint256 words
     "block_number":  "blockNumber()",                   # returns uint256, optional
     "total_mints":   "totalMints()",                    # returns uint256, optional
 }
 
-# The submit function. Most ERC918 forks use `mint(uint256 nonce)`; the
-# HASH whitepaper hints the contract may also accept a challenge digest
-# alongside the nonce, but does not commit to a signature. We default to
-# the simplest form and let the user override.
-DEFAULT_SUBMIT = "mint(uint256)"
+DEFAULT_SUBMIT = "mine(uint256)"
+
+
+def is_rate_limited_error(exc: BaseException) -> bool:
+    """Return True if an RPC exception looks like provider throttling."""
+    message = str(exc).lower()
+    return (
+        "429" in message
+        or "rate limit" in message
+        or "rate-limited" in message
+        or "too many requests" in message
+    )
 
 
 @dataclass
@@ -62,6 +59,17 @@ class MiningJob:
     target: int             # uint256 difficulty target
     epoch: int              # whatever the contract considers the current epoch
     fetched_at: float       # wall-clock seconds, for staleness checks
+
+
+@dataclass
+class MiningState:
+    era: int
+    reward: int
+    difficulty: int
+    minted: int
+    remaining: int
+    epoch: int
+    epoch_blocks_left: int
 
 
 class Hash256RpcClient:
@@ -76,17 +84,18 @@ class Hash256RpcClient:
         abi_overrides: Optional[dict[str, str]] = None,
         submit_signature: str = DEFAULT_SUBMIT,
         poa: bool = False,
+        min_request_interval: float = 1.0,
     ):
         self.w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 30}))
         if poa:
             self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-        if not self.w3.is_connected():
-            raise ConnectionError(f"could not reach RPC at {rpc_url}")
 
         self.miner_address = Web3.to_checksum_address(miner_address)
         self.contract = Web3.to_checksum_address(contract)
         self.chain_id = chain_id
         self.submit_signature = submit_signature
+        self.min_request_interval = max(0.0, min_request_interval)
+        self._last_rpc_request_at = 0.0
 
         sigs = dict(DEFAULT_VIEWS)
         if abi_overrides:
@@ -95,23 +104,61 @@ class Hash256RpcClient:
 
     # --- low-level eth_call ---------------------------------------------------
 
+    def _throttle_rpc(self) -> None:
+        if self.min_request_interval <= 0:
+            return
+        now = time.monotonic()
+        wait_seconds = self.min_request_interval - (now - self._last_rpc_request_at)
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        self._last_rpc_request_at = time.monotonic()
+
     def _call(self, sig: str, args: bytes = b"") -> bytes:
         data = selector(sig) + args
-        result = self.w3.eth.call({
-            "to": self.contract,
-            "data": "0x" + data.hex(),
-        })
+        self._throttle_rpc()
+        try:
+            result = self.w3.eth.call({
+                "to": self.contract,
+                "data": "0x" + data.hex(),
+            })
+        except Exception as exc:  # noqa: BLE001 - preserve provider details
+            raise RuntimeError(
+                f"eth_call {sig} selector=0x{data[:4].hex()} failed: {exc}"
+            ) from exc
         return bytes(result)
 
     # --- public state getters ------------------------------------------------
+
+    @staticmethod
+    def _decode_uint256_words(raw: bytes, count: int) -> list[int]:
+        if len(raw) < count * 32:
+            raise RuntimeError(
+                f"ABI response too short: expected at least {count * 32} bytes, got {len(raw)}"
+            )
+        return [
+            int.from_bytes(raw[i * 32:(i + 1) * 32], "big")
+            for i in range(count)
+        ]
+
+    def get_mining_state(self) -> MiningState:
+        raw = self._call(self._sigs["mining_state"])
+        words = self._decode_uint256_words(raw, 7)
+        return MiningState(
+            era=words[0],
+            reward=words[1],
+            difficulty=words[2],
+            minted=words[3],
+            remaining=words[4],
+            epoch=words[5],
+            epoch_blocks_left=words[6],
+        )
 
     def get_difficulty(self) -> int:
         raw = self._call(self._sigs["difficulty"])
         return int.from_bytes(raw[-32:], "big") if raw else 0
 
     def get_epoch(self) -> int:
-        raw = self._call(self._sigs["epoch"])
-        return int.from_bytes(raw[-32:], "big") if raw else 0
+        return self.get_mining_state().epoch
 
     def get_total_mints(self) -> int:
         try:
@@ -134,6 +181,8 @@ class Hash256RpcClient:
             if len(raw) >= 32:
                 return bytes(raw[:32])
         except Exception as e:  # noqa: BLE001
+            if is_rate_limited_error(e):
+                raise
             log.debug("on-chain challenge fetch failed: %s", e)
         return None
 
@@ -149,24 +198,27 @@ class Hash256RpcClient:
             epoch=epoch,
         ))
 
+    def get_block_number(self) -> int:
+        self._throttle_rpc()
+        return self.w3.eth.block_number
+
     # --- the combined "give me a job" call ------------------------------------
 
     def fetch_job(self) -> MiningJob:
         """Pull a fresh (challenge, target, epoch) snapshot from the chain."""
-        epoch = self.get_epoch()
-        difficulty = self.get_difficulty()
+        state = self.get_mining_state()
 
         # Prefer the on-chain challenge if the getter exists — it removes any
         # ambiguity about the preimage layout. Otherwise reconstruct it from
         # the whitepaper formula.
         challenge = self.get_challenge_from_chain()
         if challenge is None:
-            challenge = self.build_challenge_locally(epoch)
+            challenge = self.build_challenge_locally(state.epoch)
 
         return MiningJob(
             challenge=challenge,
-            target=difficulty,
-            epoch=epoch,
+            target=state.difficulty,
+            epoch=state.epoch,
             fetched_at=time.time(),
         )
 
@@ -186,19 +238,26 @@ class Hash256RpcClient:
             raise ValueError("nonce out of uint256 range")
 
         data = selector(self.submit_signature) + encode_uint256(nonce_value)
+        self._throttle_rpc()
         latest = self.w3.eth.get_block("latest")
-        base_fee = latest.get("baseFeePerGas") or self.w3.eth.gas_price
+        base_fee = latest.get("baseFeePerGas")
+        if base_fee is None:
+            self._throttle_rpc()
+            base_fee = self.w3.eth.gas_price
         max_priority = self.w3.to_wei(priority_fee_gwei, "gwei")
         max_fee_wei = (
             self.w3.to_wei(max_fee_gwei, "gwei") if max_fee_gwei is not None
             else base_fee * 2 + max_priority
         )
 
+        self._throttle_rpc()
+        account_nonce = self.w3.eth.get_transaction_count(account.address, "pending")
+
         return {
             "from": account.address,
             "to": self.contract,
             "data": "0x" + data.hex(),
-            "nonce": self.w3.eth.get_transaction_count(account.address, "pending"),
+            "nonce": account_nonce,
             "chainId": self.chain_id,
             "gas": gas_limit,
             "maxFeePerGas": max_fee_wei,
@@ -222,11 +281,19 @@ class Hash256RpcClient:
             return None
 
         signed = account.sign_transaction(tx)
+        self._throttle_rpc()
         tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
         return tx_hash.hex()
 
 
 def load_account_from_private_key(pk_hex: str) -> LocalAccount:
-    if not pk_hex.startswith("0x"):
-        pk_hex = "0x" + pk_hex
-    return Account.from_key(pk_hex)
+    raw = pk_hex.strip()
+    if raw.startswith(("0x", "0X")):
+        raw = raw[2:]
+    if len(raw) != 64 or any(c not in "0123456789abcdefABCDEF" for c in raw):
+        raise ValueError("private key must be a 32-byte hex string, with or without 0x")
+
+    try:
+        return Account.from_key("0x" + raw)
+    except Exception as exc:  # noqa: BLE001 - hide low-level parser details
+        raise ValueError("invalid private key") from exc

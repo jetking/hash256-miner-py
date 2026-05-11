@@ -41,22 +41,23 @@ def encode_uint256(value: int) -> bytes:
 
 # --- Challenge construction ---------------------------------------------------
 #
-# The exact byte layout of the on-chain challenge is described in the
-# whitepaper as `keccak256(chainId ‖ contract ‖ miner ‖ epoch)`. Smart
-# contracts in Solidity typically build this via abi.encodePacked, which
-# concatenates each value at its natural width:
+# The whitepaper describes the challenge as
+# `keccak256(chainId ‖ contract ‖ miner ‖ epoch)`. The deployed contract
+# builds this via Solidity abi.encode, which pads all values to 32-byte ABI
+# words:
+#
+#     chainId  : uint256 (32 bytes, big-endian)
+#     contract : address (32 bytes, left-padded)
+#     miner    : address (32 bytes, left-padded)
+#     epoch    : uint256 (32 bytes)
+#
+# `packed=True` remains available for forks that use abi.encodePacked,
+# which concatenates addresses at their natural 20-byte width:
 #
 #     chainId  : uint256 (32 bytes, big-endian)
 #     contract : address (20 bytes)
 #     miner    : address (20 bytes)
-#     epoch    : uint256 (32 bytes)        # whitepaper doesn't fix the width
-#
-# If the deployed contract instead uses abi.encode (32-byte padded) the
-# layout flips to 4 * 32 = 128 bytes. We support both via the `packed` flag
-# so the user can match whichever the verified contract uses once it ships.
-# Default is packed because that is what every Bitcoin-style PoW token I've
-# seen on Ethereum (0xBTC, ERC918 family) does, and it is by far the cheaper
-# layout in gas terms.
+#     epoch    : uint256 (32 bytes)
 
 @dataclass(frozen=True)
 class ChallengeInputs:
@@ -66,7 +67,7 @@ class ChallengeInputs:
     epoch: int      # current epoch number (whitepaper says it rotates every 100 blocks)
 
 
-def build_challenge(inputs: ChallengeInputs, *, packed: bool = True) -> bytes:
+def build_challenge(inputs: ChallengeInputs, *, packed: bool = False) -> bytes:
     """Compute the 32-byte challenge for a (miner, epoch) pair.
 
     Args:

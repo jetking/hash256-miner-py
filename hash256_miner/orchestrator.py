@@ -33,7 +33,7 @@ from typing import Optional
 from eth_account.signers.local import LocalAccount
 
 from .gpu import GpuMiner, Solution
-from .rpc import Hash256RpcClient, MiningJob
+from .rpc import Hash256RpcClient, MiningJob, is_rate_limited_error
 
 log = logging.getLogger(__name__)
 
@@ -41,12 +41,13 @@ log = logging.getLogger(__name__)
 @dataclass
 class MinerConfig:
     refresh_seconds: float = 30.0
-    print_status_seconds: float = 5.0
+    print_status_seconds: float = 2.0
     submit: bool = True            # if False, found solutions are printed only
     dry_run: bool = False
     priority_fee_gwei: float = 1.0
     max_fee_gwei: Optional[float] = None
     gas_limit: int = 200_000
+    credential_diagnostics: Optional[str] = None
 
 
 class Orchestrator:
@@ -70,7 +71,11 @@ class Orchestrator:
 
     def install_signal_handlers(self):
         def handler(signum, frame):
-            log.info("Caught signal %d, stopping after current batch...", signum)
+            print(
+                f"\n[signal] caught signal {signum}, stopping after current GPU batch...",
+                file=sys.stderr,
+                flush=True,
+            )
             self.stop()
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)
@@ -79,54 +84,85 @@ class Orchestrator:
 
     def run(self):
         self.install_signal_handlers()
-        last_status_print = 0.0
+        fetch_retry_seconds = 5.0
 
         while not self._stop.is_set():
             try:
                 job = self.rpc.fetch_job()
             except Exception as e:  # noqa: BLE001 — RPC layer is finicky
-                log.error("Failed to fetch job: %s. Retrying in 5s.", e)
-                time.sleep(5)
+                retry_seconds = fetch_retry_seconds
+                if is_rate_limited_error(e):
+                    fetch_retry_seconds = min(fetch_retry_seconds * 2, 120.0)
+                else:
+                    fetch_retry_seconds = 5.0
+                log.error(
+                    "Failed to fetch job: %s. %sRetrying in %.0fs.",
+                    e,
+                    _format_credential_diagnostics(self.config.credential_diagnostics),
+                    retry_seconds,
+                )
+                time.sleep(retry_seconds)
                 continue
+            fetch_retry_seconds = 5.0
 
-            log.info(
-                "New job: epoch=%d target=%s difficulty_bits=%.2f",
-                job.epoch,
-                "0x" + job.target.to_bytes(32, "big").hex()[:16] + "...",
-                _difficulty_bits(job.target),
-            )
+            _print_job(job, self.config)
 
             # Mine until either: solution found, epoch likely rotated, or
-            # the refresh timer fires.
-            generator = self.gpu.mine(
-                challenge=job.challenge,
-                target=job.target,
-                max_seconds=self.config.refresh_seconds,
-            )
-            for solution in generator:
-                self._handle_solution(solution, job)
-                # After submitting, break out and pull a fresh job — the
-                # contract may have advanced the epoch / difficulty.
-                break
-            else:
-                # Generator exhausted by timer — print a heartbeat and loop.
-                pass
+            # the refresh timer fires. We run the GPU in short slices so
+            # status output is visible while a job is still active.
+            while not self._stop.is_set():
+                elapsed = time.time() - job.fetched_at
+                refresh_in = self.config.refresh_seconds - elapsed
+                if refresh_in <= 0:
+                    print(
+                        f"[refresh] job age={elapsed:.1f}s reached "
+                        f"refresh interval={self.config.refresh_seconds:.1f}s; fetching new state",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    break
 
-            # Periodic status print.
-            now = time.time()
-            if now - last_status_print > self.config.print_status_seconds:
-                _print_status(self.gpu, job)
-                last_status_print = now
+                status_seconds = max(self.config.print_status_seconds, 0.1)
+                slice_seconds = min(status_seconds, refresh_in)
+                found_solution = False
+
+                generator = self.gpu.mine(
+                    challenge=job.challenge,
+                    target=job.target,
+                    max_seconds=slice_seconds,
+                )
+                for solution in generator:
+                    self._handle_solution(solution, job)
+                    found_solution = True
+                    # After submitting, break out and pull a fresh job — the
+                    # contract may have advanced the epoch / difficulty.
+                    break
+
+                _print_status(
+                    self.gpu,
+                    job,
+                    refresh_seconds=self.config.refresh_seconds,
+                )
+
+                if found_solution:
+                    break
+
+            if self._stop.is_set():
+                break
 
     def _handle_solution(self, sol: Solution, job: MiningJob):
-        log.info("🎉  Found solution!")
-        log.info("   nonce      = 0x%s", sol.nonce.to_bytes(32, "big").hex())
-        log.info("   digest     = 0x%s", sol.digest.hex())
-        log.info("   target     = 0x%s", job.target.to_bytes(32, "big").hex())
-        log.info("   epoch      = %d", job.epoch)
+        print(
+            "\n[found]\n"
+            f"  nonce  = 0x{sol.nonce.to_bytes(32, 'big').hex()}\n"
+            f"  digest = 0x{sol.digest.hex()}\n"
+            f"  target = 0x{job.target.to_bytes(32, 'big').hex()}\n"
+            f"  epoch  = {job.epoch}",
+            file=sys.stderr,
+            flush=True,
+        )
 
         if not self.config.submit:
-            log.info("submit disabled — not broadcasting")
+            print("[submit] disabled; not broadcasting", file=sys.stderr, flush=True)
             return
         if self.account is None:
             log.warning("no private key configured — cannot submit")
@@ -142,9 +178,9 @@ class Orchestrator:
                 gas_limit=self.config.gas_limit,
             )
             if tx_hash:
-                log.info("✓  submitted: 0x%s", tx_hash)
+                print(f"[submit] submitted: 0x{tx_hash}", file=sys.stderr, flush=True)
             else:
-                log.info("✓  dry-run complete")
+                print("[submit] dry-run complete", file=sys.stderr, flush=True)
         except Exception as e:  # noqa: BLE001
             log.error("Submit failed: %s", e)
 
@@ -158,16 +194,52 @@ def _difficulty_bits(target: int) -> float:
     return 256.0 - target.bit_length()
 
 
-def _print_status(gpu: GpuMiner, job: MiningJob):
+def _format_credential_diagnostics(diagnostics: Optional[str]) -> str:
+    if not diagnostics:
+        return ""
+    return f"Credential check: {diagnostics}. "
+
+
+def _print_job(job: MiningJob, config: MinerConfig):
+    target_hex = "0x" + job.target.to_bytes(32, "big").hex()
+    challenge_hex = "0x" + job.challenge.hex()
+    submit_mode = "enabled"
+    if not config.submit:
+        submit_mode = "disabled"
+    elif config.dry_run:
+        submit_mode = "dry-run"
+
+    print(
+        "[job] "
+        f"epoch={job.epoch}  "
+        f"difficulty_bits={_difficulty_bits(job.target):.2f}  "
+        f"refresh={config.refresh_seconds:.1f}s  "
+        f"status={config.print_status_seconds:.1f}s  "
+        f"submit={submit_mode}\n"
+        f"      target={target_hex}\n"
+        f"      challenge={challenge_hex}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _print_status(gpu: GpuMiner, job: MiningJob, *, refresh_seconds: float):
     rate = gpu.stats.hashrate()
     last = gpu.stats.last_hashrate()
+    age = time.time() - job.fetched_at
+    refresh_in = max(refresh_seconds - age, 0.0)
+    batch_ms = gpu.stats.last_batch_seconds * 1000.0
     print(
-        f"  [status]  hashes={gpu.stats.hashes:,}  "
+        f"[status] {time.strftime('%H:%M:%S')}  "
+        f"epoch={job.epoch}  "
+        f"age={age:.1f}s  "
+        f"refresh_in={refresh_in:.1f}s  "
+        f"hashes={gpu.stats.hashes:,}  "
         f"avg={_format_hashrate(rate)}  "
         f"inst={_format_hashrate(last)}  "
-        f"epoch={job.epoch}  "
-        f"age={time.time() - job.fetched_at:.1f}s",
+        f"last_batch={gpu.stats.last_batch_hashes:,} hashes/{batch_ms:.1f}ms",
         file=sys.stderr,
+        flush=True,
     )
 
 

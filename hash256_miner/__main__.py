@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import sys
@@ -12,7 +13,7 @@ from . import __version__
 from .gpu import GpuMiner, list_devices, pick_device
 from .orchestrator import MinerConfig, Orchestrator
 from .protocol import DEFAULT_CONTRACT, MAINNET_CHAIN_ID, verify_solution
-from .rpc import Hash256RpcClient, load_account_from_private_key
+from .rpc import DEFAULT_SUBMIT, Hash256RpcClient, load_account_from_private_key
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     mine.add_argument("--contract", default=DEFAULT_CONTRACT,
                       help=f"HASH contract address (default: {DEFAULT_CONTRACT})")
     mine.add_argument("--chain-id", type=int, default=MAINNET_CHAIN_ID)
-    mine.add_argument("--private-key", default=os.environ.get("MINER_PRIVATE_KEY"),
+    mine.add_argument("--private-key", default=None,
                       help="Private key for the miner address. Required to submit "
                            "solutions on-chain. Read from $MINER_PRIVATE_KEY by "
                            "default. Pass --no-submit to omit.")
@@ -59,6 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Work-items per kernel launch. Tune to your GPU.")
     mine.add_argument("--refresh-seconds", type=float, default=30.0,
                       help="How often to re-pull challenge/difficulty.")
+    mine.add_argument("--status-seconds", type=float, default=2.0,
+                      help="How often to print live mining status.")
+    mine.add_argument("--rpc-min-interval", type=float, default=1.0,
+                      help="Minimum seconds between JSON-RPC requests. Increase "
+                           "this for public endpoints that return HTTP/RPC 429.")
     mine.add_argument("--priority-fee-gwei", type=float, default=1.0)
     mine.add_argument("--max-fee-gwei", type=float, default=None)
     mine.add_argument("--gas-limit", type=int, default=200_000)
@@ -66,10 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
                       metavar="KEY=SIGNATURE",
                       help="Override a contract function signature. Example: "
                            "--abi-override difficulty=getDifficulty()  "
-                           "Keys: challenge_for, difficulty, epoch, total_mints.")
+                           "Keys: challenge_for, difficulty, mining_state, total_mints.")
     mine.add_argument("--submit-signature", default=None,
-                      help="Override the mint function signature, e.g. "
-                           "mint(uint256,bytes32). Default: mint(uint256)")
+                      help="Override the submit function signature, e.g. "
+                           "mint(uint256). Default: mine(uint256)")
 
     # ---------- benchmark ----------
     bench = sub.add_parser("benchmark", help="Run a self-contained GPU hashrate benchmark")
@@ -164,26 +170,22 @@ def cmd_mine(args) -> int:
         k, v = kv.split("=", 1)
         abi_overrides[k.strip()] = v.strip()
 
-    rpc = Hash256RpcClient(
-        rpc_url=args.rpc,
-        miner_address=args.address,
-        contract=args.contract,
-        chain_id=args.chain_id,
-        abi_overrides=abi_overrides,
-        submit_signature=args.submit_signature or "mint(uint256)",
-    )
-
-    # Sanity check the connection.
-    try:
-        block = rpc.w3.eth.block_number
-        print(f"Connected to RPC, head block = {block}")
-    except Exception as e:
-        print(f"error: RPC unreachable: {e}", file=sys.stderr)
-        return 1
-
     account = None
-    if args.private_key:
-        account = load_account_from_private_key(args.private_key)
+    private_key_source = None
+    if args.no_submit:
+        private_key = None
+    elif args.private_key:
+        private_key = args.private_key
+        private_key_source = "--private-key"
+    else:
+        private_key = os.environ.get("MINER_PRIVATE_KEY")
+        private_key_source = "$MINER_PRIVATE_KEY" if private_key else None
+    if private_key:
+        try:
+            account = load_account_from_private_key(private_key)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
         if account.address.lower() != args.address.lower():
             print(
                 f"warning: private key derives {account.address}, but --address is {args.address}. "
@@ -199,21 +201,88 @@ def cmd_mine(args) -> int:
         )
         return 2
 
+    try:
+        rpc = Hash256RpcClient(
+            rpc_url=args.rpc,
+            miner_address=args.address,
+            contract=args.contract,
+            chain_id=args.chain_id,
+            abi_overrides=abi_overrides,
+            submit_signature=args.submit_signature or DEFAULT_SUBMIT,
+            min_request_interval=args.rpc_min_interval,
+        )
+    except ValueError as e:
+        print(f"error: bad address or RPC configuration: {e}", file=sys.stderr)
+        return 2
+
+    # Sanity check the connection.
+    try:
+        block = rpc.get_block_number()
+        print(f"Connected to RPC, head block = {block}")
+    except Exception as e:
+        print(f"error: RPC unreachable: {e}", file=sys.stderr)
+        return 1
+
     device = pick_device(args.platform, args.device)
     print(f"Using device: {device.name.strip()}")
     gpu = GpuMiner(device, local_size=args.local_size, global_size=args.global_size)
 
     config = MinerConfig(
         refresh_seconds=args.refresh_seconds,
+        print_status_seconds=args.status_seconds,
         submit=not args.no_submit,
         dry_run=args.dry_run,
         priority_fee_gwei=args.priority_fee_gwei,
         max_fee_gwei=args.max_fee_gwei,
         gas_limit=args.gas_limit,
+        credential_diagnostics=_build_credential_diagnostics(
+            account=account,
+            private_key_source=private_key_source,
+            private_key=private_key,
+            miner_address=args.address,
+            submit=not args.no_submit,
+        ),
     )
 
     Orchestrator(rpc, gpu, account, config).run()
     return 0
+
+
+def _build_credential_diagnostics(
+    *,
+    account,
+    private_key_source: Optional[str],
+    private_key: Optional[str],
+    miner_address: str,
+    submit: bool,
+) -> str:
+    if not submit:
+        return "submit=disabled, private_key=not-used"
+    if account is None:
+        return "private_key=missing"
+
+    match = "yes" if account.address.lower() == miner_address.lower() else "no"
+    return (
+        f"private_key_source={private_key_source or 'unknown'}, "
+        f"derived_address={account.address}, "
+        f"miner_address={miner_address}, "
+        f"address_match={match}, "
+        f"key_fingerprint={_private_key_fingerprint(private_key)}"
+    )
+
+
+def _private_key_fingerprint(private_key: Optional[str]) -> str:
+    if not private_key:
+        return "unavailable"
+
+    raw = private_key.strip()
+    if raw.startswith(("0x", "0X")):
+        raw = raw[2:]
+    try:
+        digest = hashlib.sha256(bytes.fromhex(raw)).hexdigest()
+    except ValueError:
+        return "unavailable"
+    return f"sha256:{digest[:12]}"
 
 
 # ---------------------------------------------------------------------------

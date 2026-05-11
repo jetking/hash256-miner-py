@@ -45,6 +45,16 @@ pip install -e ".[test]"
 pip install -e .
 ```
 
+本仓库通常使用仓库根目录下的 `.venv` 虚拟环境。执行 Python、pytest 或 CLI 时，优先使用虚拟环境里的命令，避免落到系统 Python：
+
+```bash
+.venv/bin/python --version
+.venv/bin/python -m pytest
+.venv/bin/hash256-miner --help
+```
+
+已知本地 `.venv` 使用 Python 3.12.7，并安装了测试依赖；如果直接运行 `python`、`pytest` 或 `hash256-miner` 失败，先检查是否没有载入 `.venv`。
+
 私钥优先通过环境变量传入：
 
 ```bash
@@ -76,19 +86,19 @@ hash256-miner mine --address 0xYourMinerAddress --rpc https://eth.llamarpc.com -
 运行测试：
 
 ```bash
-pytest
+.venv/bin/python -m pytest
 ```
 
 只跑协议测试：
 
 ```bash
-pytest tests/test_protocol.py
+.venv/bin/python -m pytest tests/test_protocol.py
 ```
 
 只跑 GPU 内核测试：
 
 ```bash
-pytest tests/test_gpu_kernel.py
+.venv/bin/python -m pytest tests/test_gpu_kernel.py
 ```
 
 ## 编码约定
@@ -120,7 +130,7 @@ pytest tests/test_gpu_kernel.py
 在可行时执行：
 
 ```bash
-pytest
+.venv/bin/python -m pytest
 ```
 
 如果改动影响 CLI，也手动检查：

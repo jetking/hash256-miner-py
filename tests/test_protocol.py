@@ -59,6 +59,24 @@ def test_build_challenge_padded_layout():
     assert got == expected
 
 
+def test_build_challenge_default_matches_deployed_contract_abi_encode():
+    chain_id = 1
+    contract = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc"
+    miner = "0x000000000000000000000000000000000000dEaD"
+    epoch = 42
+
+    got = build_challenge(
+        ChallengeInputs(chain_id=chain_id, contract=contract, miner=miner, epoch=epoch),
+    )
+    expected = keccak(
+        chain_id.to_bytes(32, "big")
+        + b"\x00" * 12 + bytes.fromhex(contract[2:])
+        + b"\x00" * 12 + bytes.fromhex(miner[2:])
+        + epoch.to_bytes(32, "big")
+    )
+    assert got == expected
+
+
 def test_verify_solution_trivial_target():
     """Target = MAX_UINT256 → every nonce wins."""
     challenge = b"\x00" * 32

@@ -58,9 +58,23 @@ def list_devices() -> list[tuple[int, int, str, str]]:
     """Enumerate (platform_idx, device_idx, platform_name, device_name)."""
     out: list[tuple[int, int, str, str]] = []
     for p_idx, platform in enumerate(cl.get_platforms()):
-        for d_idx, device in enumerate(platform.get_devices()):
+        for d_idx, device in enumerate(_platform_devices(platform)):
             out.append((p_idx, d_idx, platform.name.strip(), device.name.strip()))
     return out
+
+
+def _platform_devices(
+    platform: cl.Platform,
+    *,
+    device_type: Optional[int] = None,
+) -> list[cl.Device]:
+    try:
+        if device_type is None:
+            return list(platform.get_devices())
+        return list(platform.get_devices(device_type=device_type))
+    except cl.LogicError as e:
+        log.debug("OpenCL device enumeration failed for %s: %s", platform.name.strip(), e)
+        return []
 
 
 def pick_device(platform_idx: Optional[int], device_idx: Optional[int]) -> cl.Device:
@@ -71,15 +85,22 @@ def pick_device(platform_idx: Optional[int], device_idx: Optional[int]) -> cl.De
     # Prefer GPUs over CPUs when auto-selecting.
     if platform_idx is None and device_idx is None:
         for platform in platforms:
-            gpus = platform.get_devices(device_type=cl.device_type.GPU)
+            gpus = _platform_devices(platform, device_type=cl.device_type.GPU)
             if gpus:
                 return gpus[0]
         # Fall back to whatever's there.
-        return platforms[0].get_devices()[0]
+        for platform in platforms:
+            devices = _platform_devices(platform)
+            if devices:
+                return devices[0]
+        raise RuntimeError("No OpenCL devices detected — install GPU drivers / OpenCL ICDs.")
 
     p_idx = platform_idx if platform_idx is not None else 0
     d_idx = device_idx if device_idx is not None else 0
-    return platforms[p_idx].get_devices()[d_idx]
+    devices = _platform_devices(platforms[p_idx])
+    if not devices:
+        raise RuntimeError(f"No OpenCL devices detected on platform {p_idx}.")
+    return devices[d_idx]
 
 
 class GpuMiner:
