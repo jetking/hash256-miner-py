@@ -158,7 +158,7 @@ class TuiReporter(logging.Handler):
         metrics.add_row(
             _metric_group(
                 [
-                    ("ERA", _display_state(state, "era")),
+                    ("ERA", _format_era(state)),
                     ("DIFFICULTY", _format_multiplier(job.target) if job else "—"),
                     ("PROJECTED", "—"),
                     ("EPOCH ROTATES", _format_epoch_rotation(state)),
@@ -168,7 +168,7 @@ class TuiReporter(logging.Handler):
             _metric_group(
                 [
                     ("REWARD / MINT", _format_token(_state_value(state, "reward"))),
-                    ("NEXT RETARGET", _format_next_retarget(state)),
+                    ("NEXT RETARGET", _format_next_retarget(job)),
                     ("EPOCH", _display_state(state, "epoch")),
                     ("MINTED", _format_token(_state_value(state, "minted"))),
                     ("YOUR BALANCE", _format_token(job.miner_balance if job else None)),
@@ -177,9 +177,10 @@ class TuiReporter(logging.Handler):
         )
 
         hashes = gpu.stats.hashes if gpu else 0
-        total_progress = _solution_probability(hashes, job.target) if job else 0.0
+        solution_chance = _solution_probability(hashes, job.target) if job else 0.0
+        total_progress = _total_mining_progress(state)
         round_progress = _round_progress(job, config.refresh_seconds) if job and config else 0.0
-        mints_done = _mint_count(state)
+        era_mints_done = _era_mint_count(job)
 
         progress = Table.grid(expand=True)
         progress.add_row(Text("TOTAL MINING PROGRESS", style="dim green"))
@@ -188,14 +189,14 @@ class TuiReporter(logging.Handler):
             Text(
                 f"CURRENT ROUND  {round_progress * 100:,.2f}%    "
                 f"HASHES {hashes:,}    "
-                f"SOLUTION CHANCE {total_progress * 100:,.4f}%",
+                f"SOLUTION CHANCE {solution_chance * 100:,.4f}%",
                 style="dim green",
             )
         )
         progress.add_row(_bar(round_progress, "yellow"))
-        if mints_done is not None:
-            era_progress = min(mints_done / ERA_MINTS, 1.0)
-            progress.add_row(Text(f"THIS ERA  ·  {mints_done:,} OF {ERA_MINTS:,} MINTS", style="dim green"))
+        if era_mints_done is not None:
+            era_progress = min(era_mints_done / ERA_MINTS, 1.0)
+            progress.add_row(Text(f"THIS ERA  ·  {era_mints_done:,} OF {ERA_MINTS:,} MINTS", style="dim green"))
             progress.add_row(_bar(era_progress, "yellow"))
 
         body = Table(
@@ -212,7 +213,7 @@ class TuiReporter(logging.Handler):
         body.add_row(progress)
 
         title = "[bold green] M I N I N G  S T A T E [/]"
-        subtitle = f"era {_display_state(state, 'era')}"
+        subtitle = f"era {_format_era(state)}"
         return Panel(body, title=title, subtitle=subtitle, border_style="green", box=box.SQUARE)
 
     def _device_panel(self) -> Panel:
@@ -294,6 +295,12 @@ def _display_state(state: Optional[MiningState], field: str) -> str:
     return f"{value:,}" if value is not None else "—"
 
 
+def _format_era(state: Optional[MiningState]) -> str:
+    if state is None:
+        return "—"
+    return f"{state.era + 1:,}"
+
+
 def _format_epoch_rotation(state: Optional[MiningState]) -> str:
     if state is None:
         return "—"
@@ -305,16 +312,45 @@ def _format_epoch_rotation(state: Optional[MiningState]) -> str:
 def _mint_count(state: Optional[MiningState]) -> Optional[int]:
     if state is None or state.reward <= 0:
         return None
-    return state.minted // state.reward
+    previous_minted = 0
+    for era in range(state.era):
+        era_reward = state.reward << (state.era - era)
+        previous_minted += ERA_MINTS * era_reward
+    current_era_minted = max(state.minted - previous_minted, 0)
+    return state.era * ERA_MINTS + current_era_minted // state.reward
 
 
-def _format_next_retarget(state: Optional[MiningState]) -> str:
-    mints = _mint_count(state)
+def _job_mint_count(job: Optional[MiningJob]) -> Optional[int]:
+    if job is None:
+        return None
+    if job.total_mints is not None:
+        return job.total_mints
+    return _mint_count(job.state)
+
+
+def _era_mint_count(job: Optional[MiningJob]) -> Optional[int]:
+    mints = _job_mint_count(job)
+    if mints is None:
+        return None
+    return mints % ERA_MINTS
+
+
+def _format_next_retarget(job: Optional[MiningJob]) -> str:
+    mints = _job_mint_count(job)
     if mints is None:
         return "—"
     remainder = mints % RETARGET_MINTS
     remaining = RETARGET_MINTS if remainder == 0 else RETARGET_MINTS - remainder
     return f"{remaining:,} / {RETARGET_MINTS:,} mints"
+
+
+def _total_mining_progress(state: Optional[MiningState]) -> float:
+    if state is None or state.minted <= 0:
+        return 0.0
+    mining_supply = state.minted + state.remaining
+    if mining_supply <= 0:
+        return 0.0
+    return min(max(state.minted / mining_supply, 0.0), 1.0)
 
 
 def _format_token(value: Optional[int]) -> str:

@@ -1,4 +1,16 @@
 from hash256_miner import tui
+from hash256_miner.rpc import MiningJob, MiningState
+
+
+def _job(state, *, total_mints=None):
+    return MiningJob(
+        challenge=b"\x00" * 32,
+        target=1,
+        epoch=state.epoch,
+        fetched_at=0,
+        state=state,
+        total_mints=total_mints,
+    )
 
 
 def test_parse_nvidia_smi_gpu_load_averages_multiple_devices():
@@ -30,3 +42,61 @@ def test_format_percent_handles_missing_and_clamps_values():
     assert tui._format_percent(None) == "—"
     assert tui._format_percent(-1) == "0%"
     assert tui._format_percent(42.4) == "42%"
+
+
+def test_total_mining_progress_uses_minted_over_mining_supply():
+    state = MiningState(
+        era=0,
+        reward=100 * tui.TOKEN_SCALE,
+        difficulty=1,
+        minted=1_742_580 * tui.TOKEN_SCALE,
+        remaining=17_157_420 * tui.TOKEN_SCALE,
+        epoch=123,
+        epoch_blocks_left=42,
+    )
+
+    assert tui._total_mining_progress(state) == 0.0922
+
+
+def test_era_display_is_one_based_like_the_site():
+    state = MiningState(
+        era=0,
+        reward=100 * tui.TOKEN_SCALE,
+        difficulty=1,
+        minted=0,
+        remaining=18_900_000 * tui.TOKEN_SCALE,
+        epoch=123,
+        epoch_blocks_left=42,
+    )
+
+    assert tui._format_era(state) == "1"
+
+
+def test_era_and_retarget_counts_use_total_mints_when_available():
+    state = MiningState(
+        era=1,
+        reward=50 * tui.TOKEN_SCALE,
+        difficulty=1,
+        minted=10_005_000 * tui.TOKEN_SCALE,
+        remaining=8_895_000 * tui.TOKEN_SCALE,
+        epoch=123,
+        epoch_blocks_left=42,
+    )
+    job = _job(state, total_mints=100_100)
+
+    assert tui._era_mint_count(job) == 100
+    assert tui._format_next_retarget(job) == "700 / 2,016 mints"
+
+
+def test_mint_count_fallback_accounts_for_prior_halving_eras():
+    state = MiningState(
+        era=1,
+        reward=50 * tui.TOKEN_SCALE,
+        difficulty=1,
+        minted=10_005_000 * tui.TOKEN_SCALE,
+        remaining=8_895_000 * tui.TOKEN_SCALE,
+        epoch=123,
+        epoch_blocks_left=42,
+    )
+
+    assert tui._mint_count(state) == 100_100

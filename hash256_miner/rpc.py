@@ -69,6 +69,7 @@ class MiningJob:
     fetched_at: float       # wall-clock seconds, for staleness checks
     state: Optional[MiningState] = None
     miner_balance: Optional[int] = None
+    total_mints: Optional[int] = None
 
 
 class Hash256RpcClient:
@@ -213,7 +214,12 @@ class Hash256RpcClient:
 
     # --- the combined "give me a job" call ------------------------------------
 
-    def fetch_job(self, *, include_balance: bool = False) -> MiningJob:
+    def fetch_job(
+        self,
+        *,
+        include_balance: bool = False,
+        include_total_mints: bool = False,
+    ) -> MiningJob:
         """Pull a fresh (challenge, target, epoch) snapshot from the chain."""
         state = self.get_mining_state()
 
@@ -224,6 +230,11 @@ class Hash256RpcClient:
         if challenge is None:
             challenge = self.build_challenge_locally(state.epoch)
 
+        total_mints = None
+        if include_total_mints:
+            fetched_total_mints = self.get_total_mints()
+            total_mints = fetched_total_mints if fetched_total_mints >= 0 else None
+
         return MiningJob(
             challenge=challenge,
             target=state.difficulty,
@@ -231,6 +242,7 @@ class Hash256RpcClient:
             fetched_at=time.time(),
             state=state,
             miner_balance=self.get_balance() if include_balance else None,
+            total_mints=total_mints,
         )
 
     # --- transaction submission ----------------------------------------------

@@ -151,7 +151,10 @@ class Orchestrator:
         try:
             while not self._stop.is_set():
                 try:
-                    job = self.rpc.fetch_job(include_balance=self.config.tui)
+                    job = self.rpc.fetch_job(
+                        include_balance=self.config.tui,
+                        include_total_mints=self.config.tui,
+                    )
                 except Exception as e:  # noqa: BLE001 — RPC layer is finicky
                     retry_seconds = fetch_retry_seconds
                     if is_rate_limited_error(e):
