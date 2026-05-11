@@ -50,6 +50,9 @@ static inline ulong lop3_xor3(ulong a, ulong b, ulong c) {
 // In-place Keccak-f[1600] permutation on a 25-lane state.
 static void keccak_f1600(ulong st[25]) {
     ulong t, bc0, bc1, bc2, bc3, bc4;
+#if defined(HASH256_UNROLL_KECCAK)
+    #pragma unroll
+#endif
     for (int r = 0; r < 24; r++) {
         // Theta
         bc0 = st[0] ^ st[5] ^ st[10] ^ st[15] ^ st[20];
@@ -58,7 +61,7 @@ static void keccak_f1600(ulong st[25]) {
         bc3 = st[3] ^ st[8] ^ st[13] ^ st[18] ^ st[23];
         bc4 = st[4] ^ st[9] ^ st[14] ^ st[19] ^ st[24];
 
-#if defined(__NV_CL_C_VERSION)
+#if defined(HASH256_NVIDIA) || defined(__NV_CL_C_VERSION)
         // Apply each column delta as a single three-input xor so NVIDIA's
         // backend can use LOP3 for st[i] ^ c[x-1] ^ ROT(c[x+1], 1).
         ulong rc0 = rotl64(bc1, 1);
@@ -127,6 +130,9 @@ static void keccak_f1600(ulong st[25]) {
                     st[ 1] = rotl64(tmp, 44);
 
         // Chi
+#if defined(HASH256_UNROLL_KECCAK)
+        #pragma unroll
+#endif
         for (int j = 0; j < 25; j += 5) {
             ulong a0 = st[j+0], a1 = st[j+1], a2 = st[j+2], a3 = st[j+3], a4 = st[j+4];
             st[j+0] = a0 ^ ((~a1) & a2);

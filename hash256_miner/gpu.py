@@ -127,8 +127,13 @@ class GpuMiner:
         self.stats = GpuStats()
 
         kernel_src = KERNEL_PATH.read_text(encoding="utf-8")
-        log.debug("Building OpenCL program for %s ...", device.name.strip())
-        self.program = cl.Program(self.context, kernel_src).build()
+        build_options = _opencl_build_options(device)
+        log.debug(
+            "Building OpenCL program for %s with options: %s",
+            device.name.strip(),
+            build_options or "<none>",
+        )
+        self.program = cl.Program(self.context, kernel_src).build(options=build_options)
         self.kernel = self.program.mine
 
         # Allocate device buffers once. The challenge / target / result buffers
@@ -337,3 +342,26 @@ def _opencl_runtime_error(exc: cl.Error) -> RuntimeError:
             f"Original OpenCL error: {message}"
         )
     return RuntimeError(f"OpenCL mining failed: {message}")
+
+
+def _opencl_build_options(device: cl.Device) -> list[str]:
+    """Return vendor-specific compiler switches for the mining kernel."""
+    vendor = (getattr(device, "vendor", "") or "").lower()
+    name = (getattr(device, "name", "") or "").lower()
+    options: list[str] = []
+
+    disable_vendor_options = os.environ.get("HASH256_DISABLE_VENDOR_OPTIONS", "").lower()
+    if (
+        disable_vendor_options not in {"1", "true", "yes", "on"}
+        and ("nvidia" in vendor or "nvidia" in name)
+    ):
+        options.extend([
+            "-DHASH256_NVIDIA=1",
+            "-DHASH256_UNROLL_KECCAK=1",
+        ])
+
+    extra = os.environ.get("HASH256_OPENCL_BUILD_OPTIONS", "").strip()
+    if extra:
+        options.extend(extra.split())
+
+    return options
