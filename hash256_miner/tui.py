@@ -248,7 +248,6 @@ class TuiReporter(logging.Handler):
         )
         body.add_column(ratio=1)
         body.add_row(metrics)
-        body.add_row(Text("BROWSER MINER", style="dim green"))
         body.add_row(browser)
         body.add_row(progress)
 
