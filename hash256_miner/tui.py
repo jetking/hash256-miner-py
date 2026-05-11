@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import re
+import shutil
+import subprocess
 import time
 from collections import deque
 from typing import Optional
@@ -40,6 +44,8 @@ class TuiReporter(logging.Handler):
         self.current_job: Optional[MiningJob] = None
         self.live: Optional[Live] = None
         self.previous_handlers: list[logging.Handler] = []
+        self._gpu_load: Optional[float] = None
+        self._gpu_load_checked_at = 0.0
 
     def start(self, gpu: GpuMiner, config: MinerConfig) -> None:
         self.gpu = gpu
@@ -227,8 +233,16 @@ class TuiReporter(logging.Handler):
             _kv("AVERAGE SPEED", avg),
             _kv("global/local", f"{gpu.global_size:,} / {gpu.local_size}" if gpu else "—"),
         )
-        table.add_row(_kv("last batch", last_batch), "")
+        table.add_row(_kv("last batch", last_batch), _kv("CPU LOAD", _format_cpu_load()))
+        table.add_row("", _kv("GPU LOAD", self._format_gpu_load()))
         return Panel(table, title="[bold green] DEVICE [/]", border_style="green", box=box.SQUARE)
+
+    def _format_gpu_load(self) -> str:
+        now = time.monotonic()
+        if now - self._gpu_load_checked_at >= 2.0:
+            self._gpu_load = _detect_gpu_load()
+            self._gpu_load_checked_at = now
+        return _format_percent(self._gpu_load)
 
     def _log_panel(self) -> Panel:
         text = Text()
@@ -343,6 +357,102 @@ def _format_hashrate(h_per_s: float) -> str:
             return f"{h_per_s:,.2f} {unit}"
         h_per_s /= 1000
     return f"{h_per_s:,.2f} TH/s"
+
+
+def _format_cpu_load() -> str:
+    try:
+        load_1m = os.getloadavg()[0]
+    except (AttributeError, OSError):
+        return "—"
+    cores = os.cpu_count() or 1
+    return f"{min((load_1m / cores) * 100.0, 999.0):.0f}% ({load_1m:.2f}/{cores})"
+
+
+def _detect_gpu_load() -> Optional[float]:
+    for command, parser in (
+        (
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            _parse_numeric_lines,
+        ),
+        (["rocm-smi", "--showuse", "--csv"], _parse_rocm_smi_gpu_load),
+        (["ioreg", "-r", "-d", "1", "-w", "0", "-c", "AGXAccelerator"], _parse_ioreg_gpu_load),
+    ):
+        output = _run_load_command(command)
+        if output is None:
+            continue
+        value = parser(output)
+        if value is not None:
+            return value
+    return None
+
+
+def _run_load_command(command: list[str]) -> Optional[str]:
+    if shutil.which(command[0]) is None:
+        return None
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=0.5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _parse_numeric_lines(output: str) -> Optional[float]:
+    values: list[float] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            values.append(float(line.rstrip("%")))
+        except ValueError:
+            continue
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _parse_rocm_smi_gpu_load(output: str) -> Optional[float]:
+    values: list[float] = []
+    for line in output.splitlines():
+        if "use" not in line.lower():
+            continue
+        matches = re.findall(r"\b\d+(?:\.\d+)?\b", line)
+        if matches:
+            values.append(float(matches[-1]))
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _parse_ioreg_gpu_load(output: str) -> Optional[float]:
+    values = [
+        float(value)
+        for value in re.findall(r'"Device Utilization %"\s*=\s*(\d+(?:\.\d+)?)', output)
+    ]
+    if values:
+        return sum(values) / len(values)
+
+    fallback_values = [
+        float(value)
+        for value in re.findall(r'"(?:Renderer|Tiler) Utilization %"\s*=\s*(\d+(?:\.\d+)?)', output)
+    ]
+    if not fallback_values:
+        return None
+    return max(fallback_values)
+
+
+def _format_percent(value: Optional[float]) -> str:
+    if value is None:
+        return "—"
+    return f"{min(max(value, 0.0), 999.0):.0f}%"
 
 
 def _submit_mode(config: MinerConfig) -> str:
