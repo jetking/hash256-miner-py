@@ -72,10 +72,11 @@ def test_mine_no_submit_ignores_private_key_env(monkeypatch):
         cli,
         "_load_mining_dependencies",
         lambda: (
-            lambda _device, **_kwargs: object(),
+            lambda _device, **kwargs: seen.setdefault("gpu_kwargs", kwargs) or object(),
             DummyConfig,
             DummyOrchestrator,
             lambda _platform, _device: DummyDevice(),
+            RuntimeError,
         ),
     )
 
@@ -86,6 +87,7 @@ def test_mine_no_submit_ignores_private_key_env(monkeypatch):
         "--no-submit",
         "--rpc-min-interval", "2.5",
         "--status-seconds", "1.25",
+        "--batch-cooldown-seconds", "0.1",
     ])
 
     assert rc == 0
@@ -96,6 +98,11 @@ def test_mine_no_submit_ignores_private_key_env(monkeypatch):
         "status_seconds": 1.25,
         "tui": False,
         "reporter": None,
+        "gpu_kwargs": {
+            "local_size": 256,
+            "global_size": 1 << 22,
+            "batch_cooldown_seconds": 0.1,
+        },
         "ran": True,
     }
 
@@ -116,6 +123,51 @@ def test_mine_reports_rpc_constructor_value_error(monkeypatch, capsys):
 
     assert rc == 2
     assert "error: bad address or RPC configuration: bad checksum" in capsys.readouterr().err
+
+
+def test_mine_reports_opencl_device_reset_without_traceback(monkeypatch, capsys):
+    class DeviceResetError(RuntimeError):
+        pass
+
+    class DummyRpc:
+        def get_block_number(self):
+            return 1
+
+    class DummyDevice:
+        name = "test device"
+
+    class DummyOrchestrator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self):
+            raise DeviceResetError("GPU driver reset")
+
+    monkeypatch.delenv("MINER_PRIVATE_KEY", raising=False)
+    monkeypatch.setattr(cli, "_load_rpc_dependencies", lambda: (lambda **_kwargs: DummyRpc(), object()))
+    monkeypatch.setattr(
+        cli,
+        "_load_mining_dependencies",
+        lambda: (
+            lambda _device, **_kwargs: object(),
+            lambda **kwargs: type("DummyConfig", (), kwargs)(),
+            DummyOrchestrator,
+            lambda _platform, _device: DummyDevice(),
+            DeviceResetError,
+        ),
+    )
+
+    rc = cli.main([
+        "mine",
+        "--address", "0x04cec3e6CDfeF6CcEc8c098d70FF4f6E5C00e8e8",
+        "--rpc", "http://127.0.0.1:1",
+        "--no-submit",
+    ])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "error: GPU driver reset" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_credential_diagnostics_redacts_private_key():

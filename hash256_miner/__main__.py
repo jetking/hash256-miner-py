@@ -55,6 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
     mine.add_argument("--local-size", type=int, default=256)
     mine.add_argument("--global-size", type=int, default=1 << 22,
                       help="Work-items per kernel launch. Tune to your GPU.")
+    mine.add_argument("--batch-cooldown-seconds", type=float, default=0.0,
+                      help="Sleep this many seconds between GPU kernel batches. "
+                           "Useful on Windows if the display driver resets.")
     mine.add_argument("--refresh-seconds", type=float, default=30.0,
                       help="How often to re-pull challenge/difficulty.")
     mine.add_argument("--status-seconds", type=float, default=2.0,
@@ -84,6 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--seconds", type=float, default=10.0)
     bench.add_argument("--local-size", type=int, default=256)
     bench.add_argument("--global-size", type=int, default=1 << 22)
+    bench.add_argument("--batch-cooldown-seconds", type=float, default=0.0)
 
     # ---------- devices ----------
     sub.add_parser("devices", help="List available OpenCL devices")
@@ -123,14 +127,19 @@ def cmd_benchmark(args) -> int:
     import time
 
     try:
-        GpuMiner, pick_device = _load_benchmark_dependencies()
+        GpuMiner, pick_device, OpenClDeviceResetError = _load_benchmark_dependencies()
     except ModuleNotFoundError as e:
         return _missing_dependency_error(e, command="benchmark")
 
     device = pick_device(args.platform, args.device)
     print(f"Benchmarking on: {device.name.strip()}")
 
-    miner = GpuMiner(device, local_size=args.local_size, global_size=args.global_size)
+    miner = GpuMiner(
+        device,
+        local_size=args.local_size,
+        global_size=args.global_size,
+        batch_cooldown_seconds=args.batch_cooldown_seconds,
+    )
 
     # Use a target of 1 << 252 → ~16-bit difficulty, finds many solutions but
     # we ignore them. The kernel still does the full keccak so the rate is
@@ -145,10 +154,14 @@ def cmd_benchmark(args) -> int:
 
     deadline = time.time() + args.seconds
     found = 0
-    for _ in miner.mine(challenge, target, max_seconds=args.seconds):
-        found += 1
-        if time.time() > deadline:
-            break
+    try:
+        for _ in miner.mine(challenge, target, max_seconds=args.seconds):
+            found += 1
+            if time.time() > deadline:
+                break
+    except OpenClDeviceResetError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
 
     rate = miner.stats.hashrate()
     print(f"Total hashes : {miner.stats.hashes:,}")
@@ -246,13 +259,20 @@ def cmd_mine(args) -> int:
         return 1
 
     try:
-        GpuMiner, MinerConfig, Orchestrator, pick_device = _load_mining_dependencies()
+        GpuMiner, MinerConfig, Orchestrator, pick_device, OpenClDeviceResetError = (
+            _load_mining_dependencies()
+        )
     except ModuleNotFoundError as e:
         return _missing_dependency_error(e, command="mine")
 
     device = pick_device(args.platform, args.device)
     print(f"Using device: {device.name.strip()}")
-    gpu = GpuMiner(device, local_size=args.local_size, global_size=args.global_size)
+    gpu = GpuMiner(
+        device,
+        local_size=args.local_size,
+        global_size=args.global_size,
+        batch_cooldown_seconds=args.batch_cooldown_seconds,
+    )
 
     config = MinerConfig(
         refresh_seconds=args.refresh_seconds,
@@ -280,7 +300,11 @@ def cmd_mine(args) -> int:
             return _missing_dependency_error(e, command="mine --tui")
         reporter = TuiReporter()
 
-    Orchestrator(rpc, gpu, account, config, reporter=reporter).run()
+    try:
+        Orchestrator(rpc, gpu, account, config, reporter=reporter).run()
+    except OpenClDeviceResetError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -328,9 +352,9 @@ def _load_device_listing():
 
 
 def _load_benchmark_dependencies():
-    from .gpu import GpuMiner, pick_device
+    from .gpu import GpuMiner, OpenClDeviceResetError, pick_device
 
-    return GpuMiner, pick_device
+    return GpuMiner, pick_device, OpenClDeviceResetError
 
 
 def _load_rpc_dependencies():
@@ -340,10 +364,10 @@ def _load_rpc_dependencies():
 
 
 def _load_mining_dependencies():
-    from .gpu import GpuMiner, pick_device
+    from .gpu import GpuMiner, OpenClDeviceResetError, pick_device
     from .orchestrator import MinerConfig, Orchestrator
 
-    return GpuMiner, MinerConfig, Orchestrator, pick_device
+    return GpuMiner, MinerConfig, Orchestrator, pick_device, OpenClDeviceResetError
 
 
 def _missing_dependency_error(exc: ModuleNotFoundError, *, command: str) -> int:

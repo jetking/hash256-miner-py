@@ -54,6 +54,10 @@ class Solution:
     target: int         # the target the solution beat
 
 
+class OpenClDeviceResetError(RuntimeError):
+    """Raised when the OpenCL device/context is no longer usable."""
+
+
 def list_devices() -> list[tuple[int, int, str, str]]:
     """Enumerate (platform_idx, device_idx, platform_name, device_name)."""
     out: list[tuple[int, int, str, str]] = []
@@ -112,12 +116,14 @@ class GpuMiner:
         *,
         local_size: int = 256,
         global_size: int = 1 << 22,      # 4M work-items per kernel launch
+        batch_cooldown_seconds: float = 0.0,
     ):
         self.device = device
         self.context = cl.Context([device])
         self.queue = cl.CommandQueue(self.context)
         self.local_size = local_size
         self.global_size = global_size
+        self.batch_cooldown_seconds = max(batch_cooldown_seconds, 0.0)
         self.stats = GpuStats()
 
         kernel_src = KERNEL_PATH.read_text(encoding="utf-8")
@@ -210,8 +216,11 @@ class GpuMiner:
         challenge_words = self._challenge_to_le_words(challenge)
         target_words = self._target_to_be_words(target)
 
-        cl.enqueue_copy(self.queue, self.buf_challenge, challenge_words)
-        cl.enqueue_copy(self.queue, self.buf_target, target_words)
+        try:
+            cl.enqueue_copy(self.queue, self.buf_challenge, challenge_words)
+            cl.enqueue_copy(self.queue, self.buf_target, target_words)
+        except cl.Error as exc:
+            raise _opencl_runtime_error(exc) from exc
 
         deadline = (time.time() + max_seconds) if max_seconds else None
         batch_index = 0   # increments per kernel launch; placed in bits 32..63
@@ -228,7 +237,10 @@ class GpuMiner:
 
             # Reset result buffer.
             self._result_host[:] = 0
-            cl.enqueue_copy(self.queue, self.buf_result, self._result_host)
+            try:
+                cl.enqueue_copy(self.queue, self.buf_result, self._result_host)
+            except cl.Error as exc:
+                raise _opencl_runtime_error(exc) from exc
 
             w0, w1, w2, w3 = self._split_nonce_to_be_words(current_nonce)
             # The kernel ORs `gid` (a uint32) into the bottom 32 bits of w3.
@@ -236,20 +248,23 @@ class GpuMiner:
             w3_base = w3 & 0xFFFFFFFF_00000000
 
             batch_start = time.time()
-            self.kernel(
-                self.queue,
-                (self.global_size,),
-                (self.local_size,),
-                self.buf_challenge,
-                self.buf_target,
-                np.uint64(w0),
-                np.uint64(w1),
-                np.uint64(w2),
-                np.uint64(w3_base),
-                self.buf_result,
-            )
-            cl.enqueue_copy(self.queue, self._result_host, self.buf_result)
-            self.queue.finish()
+            try:
+                self.kernel(
+                    self.queue,
+                    (self.global_size,),
+                    (self.local_size,),
+                    self.buf_challenge,
+                    self.buf_target,
+                    np.uint64(w0),
+                    np.uint64(w1),
+                    np.uint64(w2),
+                    np.uint64(w3_base),
+                    self.buf_result,
+                )
+                cl.enqueue_copy(self.queue, self._result_host, self.buf_result)
+                self.queue.finish()
+            except cl.Error as exc:
+                raise _opencl_runtime_error(exc) from exc
             batch_seconds = time.time() - batch_start
 
             self.stats.hashes += self.global_size
@@ -294,3 +309,31 @@ class GpuMiner:
             batch_index = (batch_index + 1) & 0xFFFFFFFF
             if batch_index == 0:
                 start_nonce = secrets.randbits(192) << 64
+            if self.batch_cooldown_seconds > 0:
+                if deadline is None:
+                    time.sleep(self.batch_cooldown_seconds)
+                else:
+                    remaining = deadline - time.time()
+                    if remaining > 0:
+                        time.sleep(min(self.batch_cooldown_seconds, remaining))
+
+
+def _opencl_runtime_error(exc: cl.Error) -> RuntimeError:
+    message = str(exc)
+    upper = message.upper()
+    reset_markers = (
+        "INVALID_COMMAND_QUEUE",
+        "INVALID_CONTEXT",
+        "DEVICE_NOT_AVAILABLE",
+        "OUT_OF_RESOURCES",
+        "LAUNCH_TIMEOUT",
+    )
+    if any(marker in upper for marker in reset_markers):
+        return OpenClDeviceResetError(
+            "OpenCL device/context became unusable. On Windows this usually means "
+            "the GPU driver reset the device after a long or overheated kernel run. "
+            "Reduce --global-size, try a smaller --local-size, add "
+            "--batch-cooldown-seconds, and check GPU temperature/power limits. "
+            f"Original OpenCL error: {message}"
+        )
+    return RuntimeError(f"OpenCL mining failed: {message}")
