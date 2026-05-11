@@ -12,6 +12,8 @@ from typing import Optional
 from . import __version__
 from .constants import DEFAULT_CONTRACT, DEFAULT_SUBMIT, MAINNET_CHAIN_ID
 
+DEFAULT_EVENT_LOG_FILE = "hash256-miner-events.log"
+
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -64,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="How often to print live mining status.")
     mine.add_argument("--tui", action="store_true",
                       help="Show a live terminal dashboard instead of plain status lines.")
+    mine.add_argument("--log-file", default=DEFAULT_EVENT_LOG_FILE,
+                      help="Append persistent mining events to this file. "
+                           f"Default: {DEFAULT_EVENT_LOG_FILE}")
+    mine.add_argument("--no-log-file", action="store_true",
+                      help="Disable the persistent mining event log.")
     mine.add_argument("--rpc-min-interval", type=float, default=1.0,
                       help="Minimum seconds between JSON-RPC requests. Increase "
                            "this for public endpoints that return HTTP/RPC 429.")
@@ -259,9 +266,15 @@ def cmd_mine(args) -> int:
         return 1
 
     try:
-        GpuMiner, MinerConfig, Orchestrator, pick_device, OpenClDeviceResetError = (
-            _load_mining_dependencies()
-        )
+        (
+            GpuMiner,
+            MinerConfig,
+            Orchestrator,
+            PersistentEventReporter,
+            ConsoleReporter,
+            pick_device,
+            OpenClDeviceResetError,
+        ) = _load_mining_dependencies()
     except ModuleNotFoundError as e:
         return _missing_dependency_error(e, command="mine")
 
@@ -299,6 +312,8 @@ def cmd_mine(args) -> int:
         except ModuleNotFoundError as e:
             return _missing_dependency_error(e, command="mine --tui")
         reporter = TuiReporter()
+    if not args.no_log_file and args.log_file:
+        reporter = PersistentEventReporter(reporter or ConsoleReporter(), args.log_file)
 
     try:
         Orchestrator(rpc, gpu, account, config, reporter=reporter).run()
@@ -365,9 +380,17 @@ def _load_rpc_dependencies():
 
 def _load_mining_dependencies():
     from .gpu import GpuMiner, OpenClDeviceResetError, pick_device
-    from .orchestrator import MinerConfig, Orchestrator
+    from .orchestrator import ConsoleReporter, MinerConfig, Orchestrator, PersistentEventReporter
 
-    return GpuMiner, MinerConfig, Orchestrator, pick_device, OpenClDeviceResetError
+    return (
+        GpuMiner,
+        MinerConfig,
+        Orchestrator,
+        PersistentEventReporter,
+        ConsoleReporter,
+        pick_device,
+        OpenClDeviceResetError,
+    )
 
 
 def _missing_dependency_error(exc: ModuleNotFoundError, *, command: str) -> int:

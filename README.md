@@ -126,6 +126,24 @@ hash256-miner mine ... --tui
 
 不传 `--tui` 时仍使用普通日志输出，便于脚本、重定向和 systemd 等场景。
 
+### 持久化事件日志
+
+挖矿时默认会把关键事件追加写入当前目录的 `hash256-miner-events.log`，包括启动、拉取到的新任务、
+找到候选解、提交成功、提交失败、`--no-submit`、`--dry-run` 和停止信号。普通状态行不会写入该文件，
+避免长时间运行时日志快速膨胀。
+
+可以指定日志路径：
+
+```bash
+hash256-miner mine ... --log-file /var/log/hash256-miner/events.log
+```
+
+如果只想保留屏幕输出，不写文件：
+
+```bash
+hash256-miner mine ... --no-log-file
+```
+
 ### ABI 覆盖
 
 默认 ABI 已对齐当前主网 HASH 合约。对于任何与默认值不同的函数，可以进行覆盖：

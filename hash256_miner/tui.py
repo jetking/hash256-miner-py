@@ -127,6 +127,10 @@ class TuiReporter(logging.Handler):
         self._last_tx = "dry-run"
         self._append_log("[submit] dry-run complete")
 
+    def submit_failed(self, reason: str) -> None:
+        self._last_tx = "failed"
+        self._append_log(f"[submit] failed: {reason}")
+
     def _append_log(self, line: str) -> None:
         self.log_lines.append(line)
         self._update()

@@ -28,7 +28,9 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Protocol, TextIO
 
 from eth_account.signers.local import LocalAccount
 
@@ -62,6 +64,7 @@ class MinerReporter(Protocol):
     def submit_disabled(self) -> None: ...
     def submit_success(self, tx_hash: str) -> None: ...
     def submit_dry_run(self) -> None: ...
+    def submit_failed(self, reason: str) -> None: ...
 
 
 class ConsoleReporter:
@@ -107,10 +110,119 @@ class ConsoleReporter:
         print("[submit] disabled; not broadcasting", file=sys.stderr, flush=True)
 
     def submit_success(self, tx_hash: str) -> None:
-        print(f"[submit] submitted: 0x{tx_hash}", file=sys.stderr, flush=True)
+        print(f"[submit] submitted: {_normalize_tx_hash(tx_hash)}", file=sys.stderr, flush=True)
 
     def submit_dry_run(self) -> None:
         print("[submit] dry-run complete", file=sys.stderr, flush=True)
+
+    def submit_failed(self, reason: str) -> None:
+        print(f"[submit] failed: {reason}", file=sys.stderr, flush=True)
+
+
+class PersistentEventReporter:
+    """Reporter wrapper that appends important mining events to a file."""
+
+    def __init__(self, inner: MinerReporter, path: str):
+        self.inner = inner
+        self.path = path
+        self._file: Optional[TextIO] = None
+        self._exit_signal: Optional[int] = None
+
+    def start(self, gpu: GpuMiner, config: MinerConfig) -> None:
+        path = Path(self.path).expanduser()
+        if str(path.parent) not in ("", "."):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = open(path, "a", encoding="utf-8", buffering=1)
+        self._write(
+            "task_start",
+            device=gpu.device.name.strip(),
+            submit=_submit_mode(config),
+            refresh_seconds=f"{config.refresh_seconds:.1f}",
+            status_seconds=f"{config.print_status_seconds:.1f}",
+        )
+        self._write(
+            "miner_start",
+            device=gpu.device.name.strip(),
+            submit=_submit_mode(config),
+            refresh_seconds=f"{config.refresh_seconds:.1f}",
+            status_seconds=f"{config.print_status_seconds:.1f}",
+        )
+        self.inner.start(gpu, config)
+
+    def stop(self) -> None:
+        try:
+            if self._exit_signal is not None:
+                self._write("signal_exit", signum=str(self._exit_signal))
+            self._write("miner_stop")
+        finally:
+            try:
+                self.inner.stop()
+            finally:
+                if self._file:
+                    self._file.close()
+                    self._file = None
+
+    def signal(self, signum: int) -> None:
+        self._exit_signal = signum
+        self._write("signal_exit_requested", signum=str(signum))
+        self._write("signal", signum=str(signum))
+        self.inner.signal(signum)
+
+    def job(self, job: MiningJob, config: MinerConfig) -> None:
+        self._write(
+            "job",
+            epoch=str(job.epoch),
+            target="0x" + job.target.to_bytes(32, "big").hex(),
+            challenge="0x" + job.challenge.hex(),
+            submit=_submit_mode(config),
+        )
+        self.inner.job(job, config)
+
+    def refresh(self, elapsed: float, refresh_seconds: float) -> None:
+        self._write(
+            "refresh",
+            elapsed_seconds=f"{elapsed:.1f}",
+            refresh_seconds=f"{refresh_seconds:.1f}",
+        )
+        self.inner.refresh(elapsed, refresh_seconds)
+
+    def status(self, gpu: GpuMiner, job: MiningJob, *, refresh_seconds: float) -> None:
+        self.inner.status(gpu, job, refresh_seconds=refresh_seconds)
+
+    def solution(self, sol: Solution, job: MiningJob) -> None:
+        self._write(
+            "solution_found",
+            epoch=str(job.epoch),
+            nonce="0x" + sol.nonce.to_bytes(32, "big").hex(),
+            digest="0x" + sol.digest.hex(),
+            target="0x" + job.target.to_bytes(32, "big").hex(),
+        )
+        self.inner.solution(sol, job)
+
+    def submit_disabled(self) -> None:
+        self._write("submit_disabled")
+        self.inner.submit_disabled()
+
+    def submit_success(self, tx_hash: str) -> None:
+        normalized = _normalize_tx_hash(tx_hash)
+        self._write("submit_success", tx_hash=normalized)
+        self.inner.submit_success(tx_hash)
+
+    def submit_dry_run(self) -> None:
+        self._write("submit_dry_run")
+        self.inner.submit_dry_run()
+
+    def submit_failed(self, reason: str) -> None:
+        self._write("submit_failed", reason=reason)
+        self.inner.submit_failed(reason)
+
+    def _write(self, event: str, **fields: str) -> None:
+        if self._file is None:
+            return
+        timestamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        parts = [timestamp, f"event={event}"]
+        parts.extend(f"{key}={_quote_event_value(value)}" for key, value in fields.items())
+        print(" ".join(parts), file=self._file, flush=True)
 
 
 class Orchestrator:
@@ -220,7 +332,7 @@ class Orchestrator:
             self.reporter.submit_disabled()
             return
         if self.account is None:
-            log.warning("no private key configured — cannot submit")
+            self.reporter.submit_failed("no private key configured; cannot submit")
             return
 
         try:
@@ -237,7 +349,7 @@ class Orchestrator:
             else:
                 self.reporter.submit_dry_run()
         except Exception as e:  # noqa: BLE001
-            log.error("Submit failed: %s", e)
+            self.reporter.submit_failed(str(e))
 
 
 # --- helpers ------------------------------------------------------------------
@@ -304,3 +416,22 @@ def _format_hashrate(h_per_s: float) -> str:
             return f"{h_per_s:7.2f} {unit}"
         h_per_s /= 1000
     return f"{h_per_s:7.2f} TH/s"
+
+
+def _submit_mode(config: MinerConfig) -> str:
+    if not config.submit:
+        return "disabled"
+    if config.dry_run:
+        return "dry-run"
+    return "enabled"
+
+
+def _quote_event_value(value: str) -> str:
+    text = str(value).replace("\\", "\\\\").replace("\n", "\\n")
+    if not text or any(ch.isspace() for ch in text) or "=" in text:
+        return '"' + text.replace('"', '\\"') + '"'
+    return text
+
+
+def _normalize_tx_hash(tx_hash: str) -> str:
+    return "0x" + tx_hash.removeprefix("0x")

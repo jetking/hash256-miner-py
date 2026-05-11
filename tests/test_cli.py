@@ -75,6 +75,8 @@ def test_mine_no_submit_ignores_private_key_env(monkeypatch):
             lambda _device, **kwargs: seen.setdefault("gpu_kwargs", kwargs) or object(),
             DummyConfig,
             DummyOrchestrator,
+            lambda reporter, path: ("event-reporter", reporter, path),
+            lambda: "console-reporter",
             lambda _platform, _device: DummyDevice(),
             RuntimeError,
         ),
@@ -88,6 +90,7 @@ def test_mine_no_submit_ignores_private_key_env(monkeypatch):
         "--rpc-min-interval", "2.5",
         "--status-seconds", "1.25",
         "--batch-cooldown-seconds", "0.1",
+        "--no-log-file",
     ])
 
     assert rc == 0
@@ -103,6 +106,60 @@ def test_mine_no_submit_ignores_private_key_env(monkeypatch):
             "global_size": 1 << 22,
             "batch_cooldown_seconds": 0.1,
         },
+        "ran": True,
+    }
+
+
+def test_mine_enables_default_event_log(monkeypatch):
+    class DummyRpc:
+        def get_block_number(self):
+            return 1
+
+    class DummyDevice:
+        name = "test device"
+
+    class DummyConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    seen = {}
+
+    class DummyOrchestrator:
+        def __init__(self, _rpc, _gpu, _account, _config, reporter=None):
+            seen["reporter"] = reporter
+
+        def run(self):
+            seen["ran"] = True
+
+    def make_event_reporter(reporter, path):
+        return ("event-reporter", reporter, path)
+
+    monkeypatch.delenv("MINER_PRIVATE_KEY", raising=False)
+    monkeypatch.setattr(cli, "_load_rpc_dependencies", lambda: (lambda **_kwargs: DummyRpc(), object()))
+    monkeypatch.setattr(
+        cli,
+        "_load_mining_dependencies",
+        lambda: (
+            lambda _device, **_kwargs: object(),
+            DummyConfig,
+            DummyOrchestrator,
+            make_event_reporter,
+            lambda: "console-reporter",
+            lambda _platform, _device: DummyDevice(),
+            RuntimeError,
+        ),
+    )
+
+    rc = cli.main([
+        "mine",
+        "--address", "0x04cec3e6CDfeF6CcEc8c098d70FF4f6E5C00e8e8",
+        "--rpc", "http://127.0.0.1:1",
+        "--no-submit",
+    ])
+
+    assert rc == 0
+    assert seen == {
+        "reporter": ("event-reporter", "console-reporter", cli.DEFAULT_EVENT_LOG_FILE),
         "ran": True,
     }
 
@@ -152,6 +209,8 @@ def test_mine_reports_opencl_device_reset_without_traceback(monkeypatch, capsys)
             lambda _device, **_kwargs: object(),
             lambda **kwargs: type("DummyConfig", (), kwargs)(),
             DummyOrchestrator,
+            lambda reporter, path: reporter,
+            object,
             lambda _platform, _device: DummyDevice(),
             DeviceResetError,
         ),
@@ -162,6 +221,7 @@ def test_mine_reports_opencl_device_reset_without_traceback(monkeypatch, capsys)
         "--address", "0x04cec3e6CDfeF6CcEc8c098d70FF4f6E5C00e8e8",
         "--rpc", "http://127.0.0.1:1",
         "--no-submit",
+        "--no-log-file",
     ])
 
     captured = capsys.readouterr()
