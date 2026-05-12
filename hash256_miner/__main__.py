@@ -54,9 +54,13 @@ def build_parser() -> argparse.ArgumentParser:
                       help="OpenCL platform index (see `devices`)")
     mine.add_argument("--device", type=int, default=None,
                       help="OpenCL device index within the platform")
-    mine.add_argument("--local-size", type=int, default=256)
-    mine.add_argument("--global-size", type=int, default=1 << 22,
-                      help="Work-items per kernel launch. Tune to your GPU.")
+    mine.add_argument("--local-size", type=int, default=None,
+                      help="OpenCL work-group size. Default: auto (min(256, "
+                           "device.max_work_group_size)).")
+    mine.add_argument("--global-size", type=int, default=None,
+                      help="Work-items per kernel launch. Default: auto "
+                           "(max(4M, compute_units * local_size * "
+                           "HASH256_OVER_SUBSCRIBE [256])). Tune to your GPU.")
     mine.add_argument("--batch-cooldown-seconds", type=float, default=0.0,
                       help="Sleep this many seconds between GPU kernel batches. "
                            "Useful on Windows if the display driver resets.")
@@ -92,8 +96,8 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--platform", type=int, default=None)
     bench.add_argument("--device", type=int, default=None)
     bench.add_argument("--seconds", type=float, default=10.0)
-    bench.add_argument("--local-size", type=int, default=256)
-    bench.add_argument("--global-size", type=int, default=1 << 22)
+    bench.add_argument("--local-size", type=int, default=None)
+    bench.add_argument("--global-size", type=int, default=None)
     bench.add_argument("--batch-cooldown-seconds", type=float, default=0.0)
 
     # ---------- devices ----------
@@ -147,6 +151,7 @@ def cmd_benchmark(args) -> int:
         global_size=args.global_size,
         batch_cooldown_seconds=args.batch_cooldown_seconds,
     )
+    print(f"Work size   : local={miner.local_size}, global={miner.global_size}")
 
     # Use a target of 1 << 252 → ~16-bit difficulty, finds many solutions but
     # we ignore them. The kernel still does the full keccak so the rate is
@@ -286,6 +291,7 @@ def cmd_mine(args) -> int:
         global_size=args.global_size,
         batch_cooldown_seconds=args.batch_cooldown_seconds,
     )
+    print(f"Work size: local={gpu.local_size}, global={gpu.global_size}")
 
     config = MinerConfig(
         refresh_seconds=args.refresh_seconds,

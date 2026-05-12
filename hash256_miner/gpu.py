@@ -81,6 +81,90 @@ def _platform_devices(
         return []
 
 
+DEFAULT_GLOBAL_FLOOR = 1 << 22  # 4M work items — keep as floor so small GPUs don't regress
+DEFAULT_OVER_SUBSCRIBE = 256
+DEFAULT_LOCAL_CEILING = 256
+DEFAULT_NONCES_PER_ITEM = 64
+MAX_NONCES_PER_ITEM = 256
+
+
+def _resolve_nonces_per_item() -> int:
+    """Read HASH256_NONCES_PER_ITEM; default 64. Must be a power of two in [1, 256].
+
+    Each work-item scans this many consecutive nonces in an inner loop, sharing
+    challenge / nonce-prefix registers across iterations.
+    """
+    raw = os.environ.get("HASH256_NONCES_PER_ITEM")
+    if raw is None or raw == "":
+        return DEFAULT_NONCES_PER_ITEM
+    try:
+        n = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"HASH256_NONCES_PER_ITEM must be an integer, got {raw!r}"
+        ) from exc
+    if n < 1 or n > MAX_NONCES_PER_ITEM:
+        raise ValueError(
+            f"HASH256_NONCES_PER_ITEM must be in [1, {MAX_NONCES_PER_ITEM}], got {n}"
+        )
+    if n & (n - 1):
+        raise ValueError(f"HASH256_NONCES_PER_ITEM must be a power of two, got {n}")
+    return n
+
+
+def auto_work_size(
+    device: "cl.Device",
+    local_override: Optional[int] = None,
+    global_override: Optional[int] = None,
+) -> tuple[int, int]:
+    """Pick (local_size, global_size) for a device.
+
+    local: ``min(DEFAULT_LOCAL_CEILING, device.max_work_group_size)`` unless
+    the caller overrides. global: ``max(DEFAULT_GLOBAL_FLOOR, cu * local *
+    over_subscribe)`` — the floor preserves the legacy 4M default so that
+    setups already tuned around it don't regress; the adaptive term lets
+    larger GPUs scale up automatically. ``HASH256_OVER_SUBSCRIBE`` env var
+    tunes the multiplier (default 256).
+
+    Always returns a global that is a multiple of local.
+    """
+    mwg = int(getattr(device, "max_work_group_size", DEFAULT_LOCAL_CEILING) or DEFAULT_LOCAL_CEILING)
+    cu = int(getattr(device, "max_compute_units", 1) or 1)
+
+    if local_override is not None:
+        local = int(local_override)
+        if local < 1:
+            raise ValueError("local_size must be >= 1")
+        if local > mwg:
+            raise ValueError(
+                f"local_size {local} exceeds device max_work_group_size {mwg}"
+            )
+    else:
+        local = min(DEFAULT_LOCAL_CEILING, mwg)
+
+    if global_override is not None:
+        global_size = int(global_override)
+        if global_size < local:
+            raise ValueError(
+                f"global_size {global_size} must be >= local_size {local}"
+            )
+    else:
+        try:
+            over = int(os.environ.get("HASH256_OVER_SUBSCRIBE", DEFAULT_OVER_SUBSCRIBE))
+        except ValueError:
+            over = DEFAULT_OVER_SUBSCRIBE
+        if over < 1:
+            over = DEFAULT_OVER_SUBSCRIBE
+        adaptive = cu * local * over
+        global_size = max(DEFAULT_GLOBAL_FLOOR, adaptive)
+
+    # OpenCL requires global to be a multiple of local.
+    global_size = (global_size // local) * local
+    if global_size < local:
+        global_size = local
+    return local, global_size
+
+
 def pick_device(platform_idx: Optional[int], device_idx: Optional[int]) -> cl.Device:
     platforms = cl.get_platforms()
     if not platforms:
@@ -114,20 +198,36 @@ class GpuMiner:
         self,
         device: cl.Device,
         *,
-        local_size: int = 256,
-        global_size: int = 1 << 22,      # 4M work-items per kernel launch
+        local_size: Optional[int] = None,
+        global_size: Optional[int] = None,
         batch_cooldown_seconds: float = 0.0,
     ):
         self.device = device
         self.context = cl.Context([device])
         self.queue = cl.CommandQueue(self.context)
-        self.local_size = local_size
-        self.global_size = global_size
+        resolved_local, resolved_global = auto_work_size(
+            device,
+            local_override=local_size,
+            global_override=global_size,
+        )
+        self.local_size = resolved_local
+        self.global_size = resolved_global
         self.batch_cooldown_seconds = max(batch_cooldown_seconds, 0.0)
         self.stats = GpuStats()
 
+        # Nonce bit layout (kernel ORs gid*NONCES_PER_ITEM + i into low bits of word3):
+        #   bits [0, gid_bits)   : gid_base * NONCES_PER_ITEM + i (kernel-supplied)
+        #   bits [gid_bits, 64)  : batch_index (host-supplied, per launch)
+        #   bits [64, 256)       : random start_nonce (host-supplied, persistent)
+        self.nonces_per_item = _resolve_nonces_per_item()
+        log2_n = self.nonces_per_item.bit_length() - 1
+        self._gid_bits = 32 + log2_n
+        self._batch_bits = 64 - self._gid_bits
+        self._batch_mask = (1 << self._batch_bits) - 1
+        self._w3_keep_mask = ((1 << 64) - 1) ^ ((1 << self._gid_bits) - 1)
+
         kernel_src = KERNEL_PATH.read_text(encoding="utf-8")
-        build_options = _opencl_build_options(device)
+        build_options = _opencl_build_options(device, nonces_per_item=self.nonces_per_item)
         log.debug(
             "Building OpenCL program for %s with options: %s",
             device.name.strip(),
@@ -205,17 +305,17 @@ class GpuMiner:
         Yields a `Solution` whenever the GPU finds a winning nonce. Stops
         when `max_seconds` elapses (if set) or the caller breaks out.
 
-        The kernel varies the low 32 bits of the nonce per work item. The
-        host bumps `start_nonce` by `global_size` between launches, so
-        the next kernel call covers the next contiguous slice of nonce
-        space. We pick a random 224-bit start_nonce upfront so two miners
+        The kernel varies the bottom `gid_bits = 32 + log2(NONCES_PER_ITEM)`
+        bits of the nonce per work item (each item scans NONCES_PER_ITEM
+        consecutive nonces). The host bumps `batch_index` between launches
+        so the next kernel call covers the next contiguous slice of nonce
+        space. We pick a random 192-bit start_nonce upfront so two miners
         on the same address don't collide on tested ranges.
         """
         if start_nonce is None:
-            # 192 random bits, leaving bottom 64 bits for batch advancement.
-            # Each kernel launch uses the bottom 32 bits as `gid` and the
-            # next 32 bits as the batch counter, giving us 2^32 batches per
-            # random base before we ever wrap.
+            # 192 random bits in the upper portion; the bottom 64 bits are
+            # carved up between the per-launch batch_index and the kernel's
+            # per-work-item gid (controlled by gid_bits/batch_bits).
             start_nonce = secrets.randbits(192) << 64
 
         challenge_words = self._challenge_to_le_words(challenge)
@@ -235,10 +335,13 @@ class GpuMiner:
                 return
 
             # Each batch uses:
-            #   bits 0..31    : gid (kernel-supplied, varies per work item)
-            #   bits 32..63   : batch_index (host-supplied, varies per launch)
-            #   bits 64..255  : random base from start_nonce
-            current_nonce = (start_nonce | ((batch_index & 0xFFFFFFFF) << 32)) & ((1 << 256) - 1)
+            #   bits [0, gid_bits)  : gid_base * NONCES_PER_ITEM + i (kernel)
+            #   bits [gid_bits, 64) : batch_index (host)
+            #   bits [64, 256)      : random base from start_nonce
+            current_nonce = (
+                start_nonce
+                | ((batch_index & self._batch_mask) << self._gid_bits)
+            ) & ((1 << 256) - 1)
 
             # Reset result buffer.
             self._result_host[:] = 0
@@ -248,9 +351,9 @@ class GpuMiner:
                 raise _opencl_runtime_error(exc) from exc
 
             w0, w1, w2, w3 = self._split_nonce_to_be_words(current_nonce)
-            # The kernel ORs `gid` (a uint32) into the bottom 32 bits of w3.
-            # We pre-zero those bits so the OR is unambiguous.
-            w3_base = w3 & 0xFFFFFFFF_00000000
+            # The kernel ORs (gid_base * NONCES_PER_ITEM + i) into the bottom
+            # gid_bits bits of w3. Pre-zero those bits so the OR is unambiguous.
+            w3_base = w3 & self._w3_keep_mask
 
             batch_start = time.time()
             try:
@@ -272,8 +375,9 @@ class GpuMiner:
                 raise _opencl_runtime_error(exc) from exc
             batch_seconds = time.time() - batch_start
 
-            self.stats.hashes += self.global_size
-            self.stats.last_batch_hashes = self.global_size
+            hashes_this_batch = self.global_size * self.nonces_per_item
+            self.stats.hashes += hashes_this_batch
+            self.stats.last_batch_hashes = hashes_this_batch
             self.stats.last_batch_seconds = batch_seconds
 
             found = int(self._result_host[3])
@@ -308,10 +412,10 @@ class GpuMiner:
                         "Continuing."
                     )
 
-            # Advance to the next batch. After 2^32 batches we wrap and
-            # implicitly start chewing through a new random base — vanishingly
-            # unlikely to matter in practice.
-            batch_index = (batch_index + 1) & 0xFFFFFFFF
+            # Advance to the next batch. After 2^batch_bits batches we wrap
+            # and reseed from a fresh random base — vanishingly unlikely to
+            # matter in practice.
+            batch_index = (batch_index + 1) & self._batch_mask
             if batch_index == 0:
                 start_nonce = secrets.randbits(192) << 64
             if self.batch_cooldown_seconds > 0:
@@ -344,11 +448,11 @@ def _opencl_runtime_error(exc: cl.Error) -> RuntimeError:
     return RuntimeError(f"OpenCL mining failed: {message}")
 
 
-def _opencl_build_options(device: cl.Device) -> list[str]:
+def _opencl_build_options(device: cl.Device, *, nonces_per_item: int) -> list[str]:
     """Return vendor-specific compiler switches for the mining kernel."""
     vendor = (getattr(device, "vendor", "") or "").lower()
     name = (getattr(device, "name", "") or "").lower()
-    options: list[str] = []
+    options: list[str] = [f"-DNONCES_PER_ITEM={nonces_per_item}"]
 
     disable_vendor_options = os.environ.get("HASH256_DISABLE_VENDOR_OPTIONS", "").lower()
     if (

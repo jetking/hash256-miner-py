@@ -66,13 +66,21 @@ def test_mine_no_submit_ignores_private_key_env(monkeypatch):
         seen["rpc_min_interval"] = kwargs["min_request_interval"]
         return DummyRpc()
 
+    class DummyGpu:
+        local_size = 256
+        global_size = 1 << 22
+
+    def make_gpu(_device, **kwargs):
+        seen["gpu_kwargs"] = kwargs
+        return DummyGpu()
+
     monkeypatch.setenv("MINER_PRIVATE_KEY", "0x...")
     monkeypatch.setattr(cli, "_load_rpc_dependencies", lambda: (make_rpc, object()))
     monkeypatch.setattr(
         cli,
         "_load_mining_dependencies",
         lambda: (
-            lambda _device, **kwargs: seen.setdefault("gpu_kwargs", kwargs) or object(),
+            make_gpu,
             DummyConfig,
             DummyOrchestrator,
             lambda reporter, path: ("event-reporter", reporter, path),
@@ -102,8 +110,8 @@ def test_mine_no_submit_ignores_private_key_env(monkeypatch):
         "tui": False,
         "reporter": None,
         "gpu_kwargs": {
-            "local_size": 256,
-            "global_size": 1 << 22,
+            "local_size": None,
+            "global_size": None,
             "batch_cooldown_seconds": 0.1,
         },
         "ran": True,
@@ -134,13 +142,17 @@ def test_mine_enables_default_event_log(monkeypatch):
     def make_event_reporter(reporter, path):
         return ("event-reporter", reporter, path)
 
+    class DummyGpu:
+        local_size = 256
+        global_size = 1 << 22
+
     monkeypatch.delenv("MINER_PRIVATE_KEY", raising=False)
     monkeypatch.setattr(cli, "_load_rpc_dependencies", lambda: (lambda **_kwargs: DummyRpc(), object()))
     monkeypatch.setattr(
         cli,
         "_load_mining_dependencies",
         lambda: (
-            lambda _device, **_kwargs: object(),
+            lambda _device, **_kwargs: DummyGpu(),
             DummyConfig,
             DummyOrchestrator,
             make_event_reporter,
@@ -200,13 +212,17 @@ def test_mine_reports_opencl_device_reset_without_traceback(monkeypatch, capsys)
         def run(self):
             raise DeviceResetError("GPU driver reset")
 
+    class DummyGpu:
+        local_size = 256
+        global_size = 1 << 22
+
     monkeypatch.delenv("MINER_PRIVATE_KEY", raising=False)
     monkeypatch.setattr(cli, "_load_rpc_dependencies", lambda: (lambda **_kwargs: DummyRpc(), object()))
     monkeypatch.setattr(
         cli,
         "_load_mining_dependencies",
         lambda: (
-            lambda _device, **_kwargs: object(),
+            lambda _device, **_kwargs: DummyGpu(),
             lambda **kwargs: type("DummyConfig", (), kwargs)(),
             DummyOrchestrator,
             lambda reporter, path: reporter,

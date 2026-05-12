@@ -196,66 +196,80 @@ static int digest_lt_target(const ulong st[25], __constant const ulong *target_b
 // The 256-bit nonce laid out in the preimage (bytes 32..63) is big-endian.
 // To match the Solidity behavior we treat the nonce as uint256 big-endian.
 // --------------------------------------------------------------------------
+// Number of nonces each work-item scans before exiting. Set by host via
+// -DNONCES_PER_ITEM=N. Must be a power of two in [1, 256]. Each iteration
+// only varies the low bits of word3_be; the upper lanes are cached in
+// registers so the inner loop reuses them without re-reading constants.
+#ifndef NONCES_PER_ITEM
+    #define NONCES_PER_ITEM 1
+#endif
+
 __kernel void mine(
     __constant const ulong *challenge_le,   // 4 lanes
     __constant const ulong *target_be,      // 4 lanes
     const ulong nonce_word0_be,             // bytes 32..39 of preimage (BE)
     const ulong nonce_word1_be,             // bytes 40..47
     const ulong nonce_word2_be,             // bytes 48..55
-    const ulong nonce_word3_base_be,        // bytes 56..63 base (lower 32 bits
-                                            //   replaced by gid)
+    const ulong nonce_word3_base_be,        // bytes 56..63 base; host has zeroed
+                                            //   the low (32 + log2(NONCES_PER_ITEM))
+                                            //   bits so kernel can OR them in
     __global ulong *result
 ) {
-    uint gid = get_global_id(0);
+    const ulong gid_base = (ulong)get_global_id(0);
 
-    // Compose the final 64-bit BE word that holds the varying nonce tail.
-    // nonce_word3_base_be already has the lower 32 bits zeroed by the host.
-    // The big-endian nonce tail = (high32_base) || (gid as BE 32 bits).
-    // Stored as a 64-bit LE ulong inside the state, we need bswap.
-    ulong word3_be = nonce_word3_base_be | (ulong)gid;
+    // Cache values that don't change across the inner loop in registers:
+    //   - challenge lanes (loaded from __constant once)
+    //   - byteswapped nonce_word0..2 (since the inner loop only varies word3)
+    const ulong ch0 = challenge_le[0];
+    const ulong ch1 = challenge_le[1];
+    const ulong ch2 = challenge_le[2];
+    const ulong ch3 = challenge_le[3];
+    const ulong n4 = bswap64(nonce_word0_be);
+    const ulong n5 = bswap64(nonce_word1_be);
+    const ulong n6 = bswap64(nonce_word2_be);
 
-    // Build the 1600-bit state. Rate r = 1088 bits = 136 bytes. Our message
-    // is 64 bytes — fits in one block. Padding rule for Keccak-256 (NIST
-    // SHA-3 uses 0x06, but Ethereum's keccak uses original Keccak padding
-    // 0x01 ... 0x80).
-    ulong st[25];
-    #pragma unroll
-    for (int i = 0; i < 25; i++) st[i] = 0;
+    for (uint i = 0; i < NONCES_PER_ITEM; i++) {
+        // Bottom (32 + log2(NONCES_PER_ITEM)) bits of word3 vary per call:
+        // gid_base contributes the high portion, i the low log2(N) bits.
+        const ulong nonce_low = gid_base * NONCES_PER_ITEM + (ulong)i;
+        const ulong word3_be = nonce_word3_base_be | nonce_low;
 
-    // Absorb challenge bytes 0..31 → lanes 0..3 (little-endian word order).
-    st[0] = challenge_le[0];
-    st[1] = challenge_le[1];
-    st[2] = challenge_le[2];
-    st[3] = challenge_le[3];
+        // Build the 1600-bit state. Rate r = 1088 bits = 136 bytes. Our
+        // message is 64 bytes — fits in one block. Keccak (original, not
+        // SHA-3) padding: 0x01 at byte 64, 0x80 OR'd into byte 135.
+        ulong st[25];
+        st[0] = ch0;
+        st[1] = ch1;
+        st[2] = ch2;
+        st[3] = ch3;
+        st[4] = n4;
+        st[5] = n5;
+        st[6] = n6;
+        st[7] = bswap64(word3_be);
+        // Byte 64 lives in lane 8 at byte position 0 → low byte of st[8].
+        // Byte 135 lives in lane 16 at byte position 7 → top byte of st[16].
+        st[8]  = 0x0000000000000001UL;
+        // lanes 9..15 are zero
+        st[9]  = 0; st[10] = 0; st[11] = 0; st[12] = 0;
+        st[13] = 0; st[14] = 0; st[15] = 0;
+        st[16] = 0x8000000000000000UL;
+        // lanes 17..24 are zero
+        st[17] = 0; st[18] = 0; st[19] = 0; st[20] = 0;
+        st[21] = 0; st[22] = 0; st[23] = 0; st[24] = 0;
 
-    // Absorb nonce bytes 32..63 → lanes 4..7. The nonce is conceptually
-    // big-endian in the preimage; bswap converts each 8-byte BE chunk to
-    // the little-endian ulong representation Keccak expects.
-    st[4] = bswap64(nonce_word0_be);
-    st[5] = bswap64(nonce_word1_be);
-    st[6] = bswap64(nonce_word2_be);
-    st[7] = bswap64(word3_be);
+        keccak_f1600(st);
 
-    // Keccak (original, not SHA-3) padding: append 0x01 at byte 64, then
-    // pad with zeros, then OR 0x80 into the last byte of the rate (byte 135).
-    // Byte 64 lives in lane 8 at byte position 0 → low byte of st[8].
-    // Byte 135 lives in lane 16 at byte position 7 → top byte of st[16].
-    st[8]  ^= 0x0000000000000001UL;
-    st[16] ^= 0x8000000000000000UL;
-
-    keccak_f1600(st);
-
-    // Now lanes 0..3 hold the 256-bit digest. Compare against target.
-    if (digest_lt_target(st, target_be)) {
-        // Race-safe write: atomic CAS so only the first finder wins per launch.
-        if (atomic_cmpxchg((__global int*)&result[3], 0, 1) == 0) {
-            result[0] = word3_be;          // lowest 64 BE bits of nonce
-            result[1] = nonce_word2_be;
-            result[2] = nonce_word1_be;
-            // result[3] already set to 1 by CAS
-            // We also need the very top 64 BE bits.
-            // Pack into result[4..]:
-            result[4] = nonce_word0_be;
+        // Now lanes 0..3 hold the 256-bit digest. Compare against target.
+        if (digest_lt_target(st, target_be)) {
+            // Race-safe write: atomic CAS so only the first finder wins per launch.
+            if (atomic_cmpxchg((__global int*)&result[3], 0, 1) == 0) {
+                result[0] = word3_be;          // lowest 64 BE bits of nonce
+                result[1] = nonce_word2_be;
+                result[2] = nonce_word1_be;
+                // result[3] already set to 1 by CAS
+                result[4] = nonce_word0_be;    // top 64 BE bits
+            }
+            return;
         }
     }
 }
